@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use ssz::Encode;
 use std::{io::Write, str::FromStr};
+use tracing::info;
 use url::Url;
 
 pub use error::*;
@@ -229,6 +230,16 @@ pub struct ValidatorSlotData {
     pub validator_index: u64,
     pub entry: ValidatorRegistration,
 }
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConstraintsMessage {
+    slot: u64,
+    pub constraints: Vec<Vec<Constraint>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct Constraint {
+    pub tx: Bytes,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -380,6 +391,18 @@ impl RelayClient {
     ) -> Result<Option<BuilderBlockReceived>, RelayError> {
         self.get_one_builder_block_received(&format!("block_hash={:?}", block_hash))
             .await
+    }
+
+    pub async fn get_preconf_list(&self, slot: u64) -> Result<ConstraintsMessage, RelayError> {
+        let url = {
+            let mut url = self.url.clone();
+            url.set_path(&format!("/constraints/v1/constraint/{slot:}"));
+            url
+        };
+        let resp = reqwest::get(url).await?;
+        let content = resp.bytes().await?;
+        info!("Preconf list: {:?}", content);
+        Ok(serde_json::from_slice(&content).expect("serde"))
     }
 
     pub async fn validator_registration(

@@ -3,6 +3,7 @@ pub mod block_building_helper;
 pub mod mock_block_building_helper;
 pub mod ordering_builder;
 pub mod parallel_builder;
+pub mod preconf_builder;
 
 use crate::{
     building::{BlockBuildingContext, BlockOrders, BuiltBlockTrace, SimulatedOrderSink, Sorting},
@@ -24,7 +25,7 @@ use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 use tokio::sync::{broadcast, broadcast::error::TryRecvError};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, trace, warn};
 
 /// Block we built
 #[derive(Debug, Clone)]

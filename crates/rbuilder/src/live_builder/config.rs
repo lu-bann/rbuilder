@@ -22,6 +22,7 @@ use crate::{
             parallel_builder::{
                 parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
             },
+            preconf_builder::{PreconfBuilderConfig, PreconfBuildingAlgorithm},
             BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
         },
         Sorting,
@@ -77,6 +78,7 @@ pub const DEFAULT_MAX_CONCURRENT_SEALS: u64 = 1;
 pub enum SpecificBuilderConfig {
     ParallelBuilder(ParallelBuilderConfig),
     OrderingBuilder(OrderingBuilderConfig),
+    PreconfBuilder(PreconfBuilderConfig),
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -365,6 +367,7 @@ impl LiveBuilderConfig for Config {
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P, DB>(input, config)
             }
+            _ => todo!("not implemented"),
         }
     }
 }
@@ -512,6 +515,12 @@ where
                 cfg.name,
             ))
         }
+        SpecificBuilderConfig::PreconfBuilder(config) => Arc::new(PreconfBuildingAlgorithm::new(
+            root_hash_task_pool.clone(),
+            sbundle_mergeabe_signers.to_vec(),
+            config,
+            cfg.name,
+        )),
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(
                 root_hash_config.clone(),
