@@ -1,11 +1,13 @@
 use crate::{
-    mev_boost::{RelayError, ValidatorSlotData},
+    mev_boost::{RelayError, SignedConstraints, ValidatorSlotData},
     primitives::mev_boost::{MevBoostRelay, MevBoostRelayID},
     telemetry::{inc_conn_relay_errors, inc_other_relay_errors, inc_too_many_req_relay_errors},
 };
 use alloy_primitives::Address;
+use alloy_rlp::Decodable;
 use futures::stream::FuturesOrdered;
 use primitive_types::H384;
+use reth_primitives::TransactionSignedEcRecovered;
 use tokio_stream::StreamExt;
 use tracing::{info_span, trace, warn};
 
@@ -52,6 +54,11 @@ impl RelayEpochCache {
         Ok(())
     }
 
+    /// Gets preconf list from the relay.
+    async fn get_preconf_list(&mut self, slot: u64) -> Result<Vec<SignedConstraints>, RelayError> {
+        self.relay.client.get_preconf_list(slot).await
+    }
+
     /// Might fail (None) if the slot is in the past or far in the future.
     /// Ideally, it's called just for the next slot.
     async fn get_slot_data(&mut self, slot: u64) -> Result<Option<ValidatorSlotData>, RelayError> {
@@ -84,6 +91,44 @@ impl RelaysForSlotData {
                 .map(|relay| (relay.id.clone(), RelayEpochCache::new(relay.clone())))
                 .collect(),
         }
+    }
+
+    pub async fn get_preconf_list(&mut self, slot: u64) -> Vec<TransactionSignedEcRecovered> {
+        let relay_res = self
+            .relay
+            .iter_mut()
+            .map(|(k, v)| async { (k.clone(), v.get_preconf_list(slot).await) })
+            .collect::<FuturesOrdered<_>>()
+            .collect::<Vec<_>>()
+            .await;
+
+        'relay_loop: for (relay, res) in relay_res {
+            let mut preconf_list = Vec::new();
+            let data = match res {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(err = ?e, "Relay {} returned error while getting preconf list on slot {}", relay,slot );
+                    continue;
+                }
+            };
+            for signed_constraints in data {
+                let txs_res = signed_constraints
+                    .message
+                    .transactions
+                    .iter()
+                    .map(|tx| TransactionSignedEcRecovered::decode(&mut tx.as_ref()))
+                    .collect::<Result<Vec<_>, _>>();
+                match txs_res {
+                    Ok(txs) => preconf_list.extend(txs),
+                    Err(e) => {
+                        warn!(err = ?e, "Relay {} returned error while getting preconf list on slot {}", relay, slot);
+                        continue 'relay_loop;
+                    }
+                }
+            }
+            return preconf_list;
+        }
+        Vec::new()
     }
 
     /// Asks all relays in parallel for ValidatorSlotData.

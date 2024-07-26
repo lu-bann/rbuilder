@@ -3,6 +3,7 @@ pub mod block_building_helper;
 pub mod mock_block_building_helper;
 pub mod ordering_builder;
 pub mod parallel_builder;
+pub mod preconf_builder;
 
 use crate::{
     building::{BlockBuildingContext, BlockOrders, BuiltBlockTrace, SimulatedOrderSink, Sorting},

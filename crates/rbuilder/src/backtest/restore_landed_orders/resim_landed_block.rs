@@ -50,6 +50,7 @@ where
         coinbase,
         suggested_fee_recipient,
         None,
+        vec![],
     );
 
     let state_provider = provider.history_by_block_hash(ctx.attributes.parent)?;

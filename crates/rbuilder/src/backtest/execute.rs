@@ -86,6 +86,7 @@ where
         builder_signer.address,
         block_data.winning_bid_trace.proposer_fee_recipient,
         Some(builder_signer),
+        vec![],
     );
     let (sim_orders, sim_errors) =
         simulate_all_orders_with_sim_tree(provider.clone(), &ctx, &orders, false)?;

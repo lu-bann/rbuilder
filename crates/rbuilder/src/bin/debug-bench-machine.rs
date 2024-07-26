@@ -68,6 +68,7 @@ async fn main() -> eyre::Result<()> {
         coinbase,
         suggested_fee_recipient,
         None,
+        vec![],
     );
 
     let state_provider = Arc::<dyn StateProvider>::from(

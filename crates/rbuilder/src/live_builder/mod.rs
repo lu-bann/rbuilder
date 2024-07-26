@@ -36,7 +36,7 @@ use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct TimingsConfig {
@@ -192,7 +192,7 @@ where
             // see if we can get parent header in a reasonable time
 
             let time_to_slot = payload.timestamp() - OffsetDateTime::now_utc();
-            debug!(
+            info!(
                 slot = payload.slot(),
                 block = payload.block(),
                 ?time_to_slot,
@@ -222,7 +222,7 @@ where
                 }
             };
 
-            debug!(
+            info!(
                 slot = payload.slot(),
                 block = payload.block(),
                 "Got header for slot"
@@ -239,6 +239,7 @@ where
                 Some(payload.suggested_gas_limit),
                 self.extra_data.clone(),
                 None,
+                payload.preconf_list.clone(),
             ) {
                 builder_pool.start_block_building(
                     payload,

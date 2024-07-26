@@ -162,6 +162,7 @@ async fn run_submit_to_relays_job(
 
         best_bid.wait_for_change().await;
         let block = if let Some(new_block) = best_bid.take_best_block() {
+            trace!("New best block bid value: {}", new_block.trace.bid_value);
             if new_block.trace.bid_value > last_bid_value {
                 last_bid_value = new_block.trace.bid_value;
                 new_block
