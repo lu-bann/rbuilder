@@ -21,6 +21,7 @@ use alloy_primitives::{utils::format_ether, Address, B256, U256};
 use reth::{
     primitives::constants::SLOT_DURATION, rpc::types::beacon::events::PayloadAttributesEvent,
 };
+use reth_primitives::TransactionSignedEcRecovered;
 use std::{collections::VecDeque, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +44,7 @@ pub struct MevBoostSlotData {
     /// List of relays agreeing to the slot_data. It may not contain all the relays (eg: errors, forks, validators registering only to some relays)
     pub relays: Vec<MevBoostRelayID>,
     pub slot_data: SlotData,
+    pub preconf_list: Vec<TransactionSignedEcRecovered>,
 }
 
 impl MevBoostSlotData {
@@ -130,6 +132,7 @@ impl MevBoostSlotDataGenerator {
                 if self.global_cancellation.is_cancelled() {
                     return;
                 }
+                let preconf_list = relays.get_preconf_list(event.data.proposal_slot).await;
 
                 let (slot_data, relays) =
                     if let Some(res) = relays.slot_data(event.data.proposal_slot).await {
@@ -149,6 +152,7 @@ impl MevBoostSlotDataGenerator {
                     suggested_gas_limit: slot_data.gas_limit,
                     relays,
                     slot_data,
+                    preconf_list,
                 };
 
                 if let Err(err) =

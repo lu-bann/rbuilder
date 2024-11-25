@@ -71,6 +71,7 @@ impl SlotSource for OurSlotSource {
                     suggested_gas_limit: gas_limit.unwrap_or(0),
                     relays: vec![],
                     slot_data: Default::default(),
+                    preconf_list: vec![],
                 };
 
                 if slot_sender.send(mev_boost_data).is_err() {

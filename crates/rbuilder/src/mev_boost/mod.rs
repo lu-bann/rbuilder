@@ -9,6 +9,11 @@ use alloy_primitives::{Address, BlockHash, Bytes, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, SignedBidSubmissionV2, SignedBidSubmissionV3, SignedBidSubmissionV4,
 };
+use ethereum_consensus::{
+    bellatrix::presets::minimal::Transaction,
+    crypto::{PublicKey as BlsPublicKey, Signature as BlsSignature},
+    ssz::prelude::List,
+};
 use flate2::{write::GzEncoder, Compression};
 use primitive_types::H384;
 use reqwest::{
@@ -19,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use ssz::Encode;
 use std::{io::Write, str::FromStr};
-use tracing::info;
+use tracing::debug;
 use url::Url;
 
 pub use error::*;
@@ -32,6 +37,7 @@ const GZIP_CONTENT_ENCODING: &str = "gzip";
 const BUILDER_ID_HEADER: &str = "X-Builder-Id";
 const API_TOKEN_HEADER: &str = "X-Api-Token";
 
+pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
 // @Org consolidate with primitives::mev_boost
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -230,15 +236,17 @@ pub struct ValidatorSlotData {
     pub validator_index: u64,
     pub entry: ValidatorRegistration,
 }
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ConstraintsMessage {
-    slot: u64,
-    pub constraints: Vec<Vec<Constraint>>,
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct SignedConstraints {
+    pub message: ConstraintsMessage,
+    pub signature: BlsSignature,
 }
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-pub struct Constraint {
-    pub tx: Bytes,
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ConstraintsMessage {
+    pub pubkey: BlsPublicKey,
+    pub slot: u64,
+    pub top: bool,
+    pub transactions: List<Transaction, MAX_CONSTRAINTS_PER_SLOT>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -393,15 +401,15 @@ impl RelayClient {
             .await
     }
 
-    pub async fn get_preconf_list(&self, slot: u64) -> Result<ConstraintsMessage, RelayError> {
+    pub async fn get_preconf_list(&self, slot: u64) -> Result<Vec<SignedConstraints>, RelayError> {
         let url = {
             let mut url = self.url.clone();
-            url.set_path(&format!("/constraints/v1/constraint/{slot:}"));
+            url.set_path(&format!("/relay/v1/builder/constraints?slot={slot:}"));
             url
         };
         let resp = reqwest::get(url).await?;
         let content = resp.bytes().await?;
-        info!("Preconf list: {:?}", content);
+        debug!("Getting preconf list from relay: {:?}", content);
         Ok(serde_json::from_slice(&content).expect("serde"))
     }
 

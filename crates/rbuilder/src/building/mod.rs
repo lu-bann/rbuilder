@@ -15,7 +15,7 @@ use eth_sparse_mpt::SparseTrieSharedCache;
 use reth_db::Database;
 use reth_primitives::{proofs::calculate_requests_root, TransactionSignedEcRecovered};
 use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
-use tracing::{info, trace};
+use tracing::trace;
 
 use crate::{
     primitives::{
@@ -260,6 +260,7 @@ impl BlockBuildingContext {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
         )
     }
 
@@ -467,6 +468,60 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
 
     pub fn free_reserved_gas(&mut self) {
         self.gas_reserved = 0;
+    }
+
+    pub fn commit_no_sim_order(
+        &mut self,
+        order: &Order,
+        ctx: &BlockBuildingContext,
+        state: &mut BlockState,
+    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
+        if ctx.builder_signer.is_none() {
+            // Return here to avoid wasting time on a call to fork.commit_order that 99% will fail
+            return Ok(Err(ExecutionError::OrderError(OrderErr::Bundle(
+                BundleErr::NoSigner,
+            ))));
+        }
+
+        let mut fork = PartialBlockFork::new(state).with_tracer(&mut self.tracer);
+        let exec_result = fork.commit_order(
+            &order,
+            ctx,
+            self.gas_used,
+            self.gas_reserved,
+            self.blob_gas_used,
+            self.discard_txs,
+        )?;
+        let ok_result = match exec_result {
+            Ok(ok) => ok,
+            Err(err) => {
+                return Ok(Err(err.into()));
+            }
+        };
+
+        let inplace_sim_result = SimValue::new(
+            ok_result.coinbase_profit,
+            ok_result.gas_used,
+            ok_result.blob_gas_used,
+            ok_result.paid_kickbacks.clone(),
+        );
+
+        self.gas_used += ok_result.gas_used;
+        self.blob_gas_used += ok_result.blob_gas_used;
+        self.coinbase_profit += ok_result.coinbase_profit;
+        self.executed_tx.extend(ok_result.txs.clone());
+        self.receipts.extend(ok_result.receipts.clone());
+        Ok(Ok(ExecutionResult {
+            coinbase_profit: ok_result.coinbase_profit,
+            inplace_sim: inplace_sim_result,
+            gas_used: ok_result.gas_used,
+            order: order.clone(),
+            txs: ok_result.txs,
+            original_order_ids: ok_result.original_order_ids,
+            receipts: ok_result.receipts,
+            nonces_updated: ok_result.nonces_updated,
+            paid_kickbacks: ok_result.paid_kickbacks,
+        }))
     }
 
     pub fn commit_order(

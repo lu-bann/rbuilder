@@ -18,13 +18,11 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
-    mev_boost::Constraint,
     telemetry::inc_active_slots,
     utils::{error_storage::spawn_error_storage_writer, Signer},
 };
 use ahash::HashSet;
 use alloy_primitives::{Address, B256};
-use alloy_rlp::Decodable;
 use building::BlockBuildingPool;
 use eyre::Context;
 use jsonrpsee::RpcModule;
@@ -34,13 +32,11 @@ use reth::{primitives::Header, providers::HeaderProvider};
 use reth_chainspec::ChainSpec;
 use reth_db::Database;
 use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
-use std::fmt::Debug;
-use reth_primitives::TransactionSignedEcRecovered;
-use std::{cmp::min, path::PathBuf, sync::Arc, time::Duration};
+use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct TimingsConfig {
@@ -229,27 +225,7 @@ where
             );
 
             inc_active_slots();
-            let mut preconf_list = Vec::new();
-            for relay in self.relays.iter() {
-                match relay.client.get_preconf_list(payload.slot()).await {
-                    Ok(constraints) => {
-                        let constraints: Vec<Constraint> =
-                            constraints.constraints.into_iter().flatten().collect();
-                        let txs = constraints
-                            .into_iter()
-                            .map(|c| TransactionSignedEcRecovered::decode(&mut c.tx.as_ref()))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        preconf_list.extend(txs);
-                    }
-                    Err(e) => {
-                        warn!(
-                            slot = payload.slot(),
-                            "Failed to get preconf list from relay: {:?}", e
-                        );
-                    }
-                };
-            }
-            info!("preconf list {:?}", preconf_list);
+
             let block_ctx = BlockBuildingContext::from_attributes(
                 payload.payload_attributes_event.clone(),
                 &parent_header,
@@ -259,7 +235,7 @@ where
                 Some(payload.suggested_gas_limit),
                 self.extra_data.clone(),
                 None,
-                preconf_list,
+                payload.preconf_list.clone(),
             );
 
             builder_pool.start_block_building(

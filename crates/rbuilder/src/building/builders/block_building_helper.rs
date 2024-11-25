@@ -8,7 +8,7 @@ use alloy_primitives::U256;
 use reth::tasks::pool::BlockingTaskPool;
 use reth_db::Database;
 use reth_payload_builder::database::CachedReads;
-use reth_primitives::format_ether;
+use reth_primitives::{format_ether, TransactionSignedEcRecovered};
 use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
@@ -21,7 +21,7 @@ use crate::{
         EstimatePayoutGasErr, ExecutionError, ExecutionResult, FinalizeError, FinalizeResult,
         PartialBlock, Sorting,
     },
-    primitives::SimulatedOrder,
+    primitives::{MempoolTx, Order, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
     roothash::RootHashConfig,
     telemetry,
 };
@@ -208,6 +208,34 @@ where
             cancel_on_fatal_error,
             phantom: PhantomData,
         })
+    }
+
+    pub fn commit_preconf_tx(
+        &mut self,
+        tx: TransactionSignedEcRecovered,
+    ) -> Result<Result<&ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
+        let tx_with_blobs = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx)
+            .expect("blob is not supported yet");
+        let order = Order::Tx(MempoolTx::new(tx_with_blobs));
+        let result = self.partial_block.commit_no_sim_order(
+            &order,
+            &self.building_ctx,
+            &mut self.block_state,
+        );
+        match result {
+            Ok(ok_result) => match ok_result {
+                Ok(res) => {
+                    self.built_block_trace.add_included_order(res);
+                    Ok(Ok(self.built_block_trace.included_orders.last().unwrap()))
+                }
+                Err(err) => {
+                    self.built_block_trace
+                        .modify_payment_when_no_signer_error(&err);
+                    Ok(Err(err))
+                }
+            },
+            Err(e) => Err(e),
+        }
     }
 
     /// Trace and telemetry

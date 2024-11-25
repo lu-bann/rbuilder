@@ -57,8 +57,8 @@ use reth_provider::{
 };
 use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
-use std::fmt::Debug;
 use std::{
+    fmt::Debug,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -516,6 +516,7 @@ where
             ))
         }
         SpecificBuilderConfig::PreconfBuilder(config) => Arc::new(PreconfBuildingAlgorithm::new(
+            root_hash_config.clone(),
             root_hash_task_pool.clone(),
             sbundle_mergeabe_signers.to_vec(),
             config,

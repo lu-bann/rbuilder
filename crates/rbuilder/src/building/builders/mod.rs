@@ -25,7 +25,7 @@ use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 use tokio::sync::{broadcast, broadcast::error::TryRecvError};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, trace, warn};
+use tracing::{error, warn};
 
 /// Block we built
 #[derive(Debug, Clone)]
