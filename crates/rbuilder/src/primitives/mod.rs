@@ -4,6 +4,7 @@ pub mod fmt;
 pub mod mev_boost;
 pub mod order_builder;
 pub mod serialize;
+pub mod proofs;
 mod test_data_generator;
 
 use crate::building::evm_inspector::UsedStateTrace;
