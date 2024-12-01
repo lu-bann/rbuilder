@@ -60,11 +60,13 @@ The main entrypoint `LiveBuilder::run()` initializes several long-lived componen
       MainThread-- polls -->payload_events_channel
       payload_events_channel
       MainThread("🔄Main thread")
+/*
       RPC
       RPC--eth_sendBundle-->Ch1
       RPC--mev_sendBundle-->Ch1
       RPC--eth_cancelBundle-->Ch1
       RPC--eth_sendRawTransaction-->Ch1
+*/
       MemPool("Mempool<br>(reth connection)")--new txs-->Ch1
       Ch1("channel")
       OrderPool("**OrderPool**")
