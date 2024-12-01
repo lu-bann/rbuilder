@@ -1,19 +1,13 @@
-use std::collections::HashMap;
-
 use alloy_primitives::{Bytes, TxHash};
 use alloy_rlp::Encodable;
 use ethereum_consensus::{
-    bellatrix::presets::minimal::Transaction,
-    deneb::minimal::MAX_TRANSACTIONS_PER_PAYLOAD,
-    phase0::Bytes32,
-    // primitives::{BlsPublicKey, BlsSignature},
-    ssz::prelude::*,
+    bellatrix::presets::minimal::Transaction, deneb::minimal::MAX_TRANSACTIONS_PER_PAYLOAD,
+    phase0::Bytes32, ssz::prelude::*,
 };
 use reth_primitives::TransactionSignedEcRecovered;
 
 pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
 
-pub type HashToConstraintDecoded = HashMap<TxHash, TransactionSignedEcRecovered>;
 pub type ExecutionPayloadTransactions = List<Transaction, MAX_TRANSACTIONS_PER_PAYLOAD>;
 
 #[derive(Debug, thiserror::Error)]
@@ -30,7 +24,7 @@ pub enum ProofError {
     DecodingFailed(String),
 }
 
-// InclusionProof is a Merkle Multiproof of inclusion of a set of TransactionHashes
+/// InclusionProof is a Merkle Multiproof of inclusion of a set of TransactionHashes
 #[derive(Debug, Clone, SimpleSerialize, serde::Serialize, serde::Deserialize)]
 pub struct InclusionProofs {
     pub transaction_hashes: List<Bytes32, MAX_CONSTRAINTS_PER_SLOT>,
@@ -47,12 +41,10 @@ impl InclusionProofs {
 
 pub fn calculate_merkle_multi_proofs(
     payload_transactions: Vec<TransactionSignedEcRecovered>,
-    hash_to_constraint_decoded: HashToConstraintDecoded,
+    constraints: Vec<TransactionSignedEcRecovered>,
 ) -> Result<InclusionProofs, ProofError> {
-    let constraints = hash_to_constraint_decoded.values().collect::<Vec<_>>();
-
     let mut raw_txs = Vec::with_capacity(payload_transactions.len());
-    for tx in payload_transactions {
+    for tx in payload_transactions.clone() {
         let mut tx_bytes = Vec::new();
         tx.encode(&mut tx_bytes);
         raw_txs.push(Bytes::from(tx_bytes));
@@ -69,23 +61,32 @@ pub fn calculate_merkle_multi_proofs(
 
     let _root_node = ssz_txs.hash_tree_root().unwrap();
 
-    let indexes: Vec<usize> = Vec::with_capacity(constraints.len());
+    let mut indexes: Vec<usize> = Vec::with_capacity(constraints.len());
+    for constraint in constraints.clone() {
+        let tx_hash = constraint.hash();
+        let index = payload_transactions
+            .iter()
+            .position(|tx| tx.hash() == tx_hash)
+            .ok_or(ProofError::MissingHash(tx_hash))?;
+        indexes.push(index);
+    }
 
     let path = indexes
         .iter()
         .map(|i| PathElement::from(*i))
         .collect::<Vec<PathElement>>();
 
-    let (multi_proof, _) = ssz_txs.multi_prove(&[&path]).unwrap();
+    let (multi_proof, witness) = ssz_txs.multi_prove(&[&path]).unwrap();
+    assert!(multi_proof.verify(witness).is_ok());
     let inclusion_proof = create_inclusion_proof_from_multi_proof(multi_proof, constraints)?;
 
     Ok(inclusion_proof)
 }
 
-/// converts a Multiproof into an InclusionProof, without filling the TransactionHashes
+/// Create InclusionProofs from a MultiProof and a list of constraints
 fn create_inclusion_proof_from_multi_proof(
     multi_proof: ssz_rs::proofs::MultiProof,
-    constraints: Vec<&TransactionSignedEcRecovered>,
+    constraints: Vec<TransactionSignedEcRecovered>,
 ) -> Result<InclusionProofs, ProofError> {
     let mut generalised_indexes = Vec::with_capacity(multi_proof.indices.len());
     let mut merkle_hashes = Vec::with_capacity(multi_proof.branch.len());
@@ -109,4 +110,34 @@ fn create_inclusion_proof_from_multi_proof(
         generalized_indexes: List::try_from(generalised_indexes).unwrap(),
         merkle_hashes: List::try_from(merkle_hashes).unwrap(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::primitives::{AccountNonce, TestDataGenerator};
+
+    use super::*;
+    use reth_primitives::TransactionSignedEcRecovered;
+    use revm_primitives::Address;
+
+    #[test]
+    fn test_calculate_merkle_multi_proofs() {
+        let mut test_data_generator = TestDataGenerator::default();
+        let mut nonce = 0;
+
+        let payload_txs = (0..5)
+            .map(|_| {
+                let tx = test_data_generator.create_tx_nonce(AccountNonce {
+                    nonce,
+                    account: Address::default(),
+                });
+                nonce += 1;
+                tx
+            })
+            .collect::<Vec<TransactionSignedEcRecovered>>();
+        let constraints = vec![payload_txs[1].clone(), payload_txs[3].clone()];
+
+        let inclusion_proof = calculate_merkle_multi_proofs(payload_txs.clone(), constraints);
+        assert!(inclusion_proof.is_ok())
+    }
 }
