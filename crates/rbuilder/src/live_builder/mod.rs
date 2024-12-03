@@ -3,6 +3,7 @@ pub mod block_output;
 pub mod building;
 pub mod cli;
 pub mod config;
+pub mod constraint_client;
 pub mod order_input;
 pub mod payload_events;
 pub mod simulation;
@@ -18,15 +19,18 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
+    primitives::constraints::SignedConstraints,
     telemetry::inc_active_slots,
     utils::{error_storage::spawn_error_storage_writer, Signer},
 };
-use ahash::HashSet;
+use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, B256};
 use building::BlockBuildingPool;
+use constraint_client::ConstraintSubscriber;
 use eyre::Context;
 use jsonrpsee::RpcModule;
 use order_input::ReplaceableOrderPoolCommand;
+use parking_lot::RwLock;
 use payload_events::MevBoostSlotData;
 use reth::{primitives::Header, providers::HeaderProvider};
 use reth_chainspec::ChainSpec;
@@ -110,6 +114,11 @@ where
     /// Notify rbuilder of new [`ReplaceableOrderPoolCommand`] flow via this channel.
     pub orderpool_sender: mpsc::Sender<ReplaceableOrderPoolCommand>,
     pub orderpool_receiver: mpsc::Receiver<ReplaceableOrderPoolCommand>,
+
+    /// constraint stream subsciber
+    pub constraint_subscriber: Option<ConstraintSubscriber>,
+    /// Used to store constraints
+    pub constraint_store: Arc<RwLock<HashMap<u64, Vec<SignedConstraints>>>>,
 }
 
 impl<P, DB, BlocksSourceType: SlotSource> LiveBuilder<P, DB, BlocksSourceType>
@@ -128,6 +137,13 @@ where
 
     pub fn with_builders(self, builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>) -> Self {
         Self { builders, ..self }
+    }
+
+    pub fn with_constraint_subscriber(self, subscriber: ConstraintSubscriber) -> Self {
+        Self {
+            constraint_subscriber: Some(subscriber),
+            ..self
+        }
     }
 
     pub async fn run(self) -> eyre::Result<()> {
@@ -179,6 +195,17 @@ where
         );
 
         let watchdog_sender = spawn_watchdog_thread(self.watchdog_timeout)?;
+
+        let mut constraint_stream_channel = self.constraint_subscriber.unwrap().spawn();
+        tokio::spawn(async move {
+            while let Some(constraint) = constraint_stream_channel.recv().await {
+                self.constraint_store
+                    .write()
+                    .entry(constraint.message.slot)
+                    .or_default()
+                    .push(constraint);
+            }
+        });
 
         while let Some(payload) = payload_events_channel.recv().await {
             if self.blocklist.contains(&payload.fee_recipient()) {

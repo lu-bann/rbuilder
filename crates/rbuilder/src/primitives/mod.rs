@@ -1,10 +1,11 @@
 //! Order types used as elements for block building.
 
+pub mod constraints;
 pub mod fmt;
 pub mod mev_boost;
 pub mod order_builder;
-pub mod serialize;
 pub mod proofs;
+pub mod serialize;
 mod test_data_generator;
 
 use crate::building::evm_inspector::UsedStateTrace;

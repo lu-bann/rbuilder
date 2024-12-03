@@ -79,6 +79,9 @@ pub struct BaseConfig {
     pub blocklist_file_path: Option<PathBuf>,
     pub extra_data: String,
 
+    /// verify constraint signatures if enabled
+    pub verify_constraints: bool,
+
     /// mev-share bundles coming from this address are treated in a special way(see [`ShareBundleMerger`])
     pub sbundle_mergeabe_signers: Option<Vec<Address>>,
 
@@ -232,6 +235,9 @@ impl BaseConfig {
 
             orderpool_sender,
             orderpool_receiver,
+
+            constraint_subscriber: None,
+            constraint_store: Default::default(),
         })
     }
 
@@ -436,6 +442,7 @@ impl Default for BaseConfig {
             reth_static_files_path: None,
             blocklist_file_path: None,
             extra_data: "extra_data_change_me".to_string(),
+            verify_constraints: false,
             root_hash_use_sparse_trie: false,
             root_hash_compare_sparse_trie: false,
             watchdog_timeout_sec: 60 * 3,

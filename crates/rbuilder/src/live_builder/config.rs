@@ -13,6 +13,7 @@ use super::{
         block_sealing_bidder_factory::BlockSealingBidderFactory,
         relay_submit::{RelaySubmitSinkFactory, SubmissionConfig},
     },
+    constraint_client::ConstraintSubscriber,
 };
 use crate::{
     beacon_api_client::Client,
@@ -290,6 +291,7 @@ impl LiveBuilderConfig for Config {
     fn base_config(&self) -> &BaseConfig {
         &self.base_config
     }
+
     async fn new_builder<P, DB>(
         &self,
         provider: P,
@@ -326,14 +328,15 @@ impl LiveBuilderConfig for Config {
 
         let payload_event = MevBoostSlotDataGenerator::new(
             self.l1_config.beacon_clients()?,
-            relays,
+            relays.clone(),
             self.base_config.blocklist()?,
             cancellation_token.clone(),
         );
+
         let live_builder = self
             .base_config
             .create_builder_with_provider_factory(
-                cancellation_token,
+                cancellation_token.clone(),
                 sink_factory,
                 payload_event,
                 provider,
@@ -345,7 +348,11 @@ impl LiveBuilderConfig for Config {
             root_hash_config,
             self.base_config.sbundle_mergeabe_signers(),
         );
-        Ok(live_builder.with_builders(builders))
+
+        let subscriber = ConstraintSubscriber::new(relays, cancellation_token.clone());
+        Ok(live_builder
+            .with_builders(builders)
+            .with_constraint_subscriber(subscriber))
     }
 
     fn version_for_telemetry(&self) -> crate::utils::build_info::Version {

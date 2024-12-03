@@ -13,7 +13,7 @@ use flate2::{write::GzEncoder, Compression};
 use primitive_types::H384;
 use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
-    Body, Response, StatusCode,
+    Body, RequestBuilder, Response, StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
@@ -407,6 +407,16 @@ impl RelayClient {
                 Err(RelayError::RelayError(error))
             }
         }
+    }
+
+    pub fn build_constraint_stream_request(&self) -> RequestBuilder {
+        let url = {
+            let mut url = self.url.clone();
+            url.set_path("/relay/v1/data/constraint_stream");
+            url
+        };
+
+        self.client.get(url).header("header", "text/event-stream")
     }
 
     /// Calls /relay/v1/builder/validators to get "validator registrations for validators scheduled to propose in the current and next epoch."

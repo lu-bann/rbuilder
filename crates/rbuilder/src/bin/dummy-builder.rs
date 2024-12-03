@@ -114,6 +114,8 @@ async fn main() -> eyre::Result<()> {
         run_sparse_trie_prefetcher: false,
         orderpool_sender,
         orderpool_receiver,
+        constraint_subscriber: None,
+        constraint_store: Default::default(),
     };
 
     let ctrlc = tokio::spawn(async move {
