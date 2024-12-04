@@ -50,6 +50,10 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
         unimplemented!()
     }
 
+    fn set_constraints(&mut self, _constraints: Vec<TransactionSignedEcRecoveredWithBlobs>) {
+        unimplemented!()
+    }
+
     fn commit_constraint(
         &mut self,
         _constraint: &TransactionSignedEcRecoveredWithBlobs,

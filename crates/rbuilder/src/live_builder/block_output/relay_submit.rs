@@ -4,7 +4,10 @@ use crate::{
     mev_boost::{
         sign_block_for_relay, BLSBlockSigner, RelayError, SubmitBlockErr, SubmitBlockRequest,
     },
-    primitives::mev_boost::{MevBoostRelay, MevBoostRelayID},
+    primitives::{
+        mev_boost::{MevBoostRelay, MevBoostRelayID},
+        proofs::calculate_merkle_multi_proofs,
+    },
     telemetry::{
         add_relay_submit_time, add_subsidy_value, inc_conn_relay_errors,
         inc_failed_block_simulations, inc_initiated_submissions, inc_other_relay_errors,
@@ -18,7 +21,7 @@ use ahash::HashMap;
 use alloy_primitives::{utils::format_ether, U256};
 use mockall::automock;
 use reth_chainspec::ChainSpec;
-use reth_primitives::SealedBlock;
+use reth_primitives::{SealedBlock, TransactionSigned};
 use std::sync::{Arc, Mutex};
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -179,6 +182,24 @@ async fn run_submit_to_relays_job(
 
         let builder_name = block.builder_name.clone();
 
+        // generate inclusion proofs for constraints if present for the slot
+        let inclusion_proofs = match &block.trace.slot_constraints {
+            Some(constraints) => {
+                let payload_transactions = block.sealed_block.body.transactions.clone();
+                let slot_constraints: Vec<TransactionSigned> = constraints
+                    .iter()
+                    .map(|tx| tx.clone().into_internal_tx_unsecure().into_signed())
+                    .collect();
+
+                debug!(
+                    "Calculating inclusion proofs for slot: {:?}",
+                    slot_constraints
+                );
+                Some(calculate_merkle_multi_proofs(payload_transactions, slot_constraints).unwrap())
+            }
+            None => None,
+        };
+
         let bundles = block
             .trace
             .included_orders
@@ -218,6 +239,7 @@ async fn run_submit_to_relays_job(
                 &slot_data.payload_attributes_event.data,
                 slot_data.slot_data.pubkey,
                 block.trace.bid_value,
+                inclusion_proofs,
             ) {
                 Ok(res) => res,
                 Err(err) => {
@@ -234,6 +256,7 @@ async fn run_submit_to_relays_job(
                 &slot_data.payload_attributes_event.data,
                 slot_data.slot_data.pubkey,
                 block.trace.bid_value,
+                None,
             ) {
                 Ok(res) => res,
                 Err(err) => {

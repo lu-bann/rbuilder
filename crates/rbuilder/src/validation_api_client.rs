@@ -78,6 +78,7 @@ impl ValidationAPIClient {
             SubmitBlockRequest::Capella(_) => "flashbots_validateBuilderSubmissionV2",
             SubmitBlockRequest::Deneb(_) => "flashbots_validateBuilderSubmissionV3",
             SubmitBlockRequest::Electra(_) => "flashbots_validateBuilderSubmissionV4",
+            SubmitBlockRequest::DenebWithProofs(_) => todo!(),
         };
         let request = ValidRequest {
             req: req.clone(),

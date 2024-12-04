@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info_span, trace};
+use tracing::{error, info_span, trace, warn};
 
 use super::{
     block_building_helper::BlockBuildingHelperFromProvider, handle_building_error,
@@ -339,12 +339,13 @@ where
         )?;
 
         // fill constraints
-        self.fill_constraints(
+        let constraints = self.fill_constraints(
             &mut block_building_helper,
             slot_constraints,
             block_orders.clone(),
             build_start,
         )?;
+        block_building_helper.set_constraints(constraints);
 
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
@@ -358,7 +359,8 @@ where
         slot_constraints: Vec<SignedConstraints>,
         mut block_orders: BlockOrders,
         build_start: Instant,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<Vec<TransactionSignedEcRecoveredWithBlobs>> {
+        let mut result = Vec::new();
         for constraint in slot_constraints {
             let transactions = constraint.message.transactions.to_vec();
             for tx in transactions {
@@ -393,6 +395,10 @@ where
                         block_orders.update_onchain_nonces(&nonces_updated);
                     }
                     Err(err) => {
+                        warn!(
+                            ?err,
+                            "Error committing constraint, block submission will fail"
+                        );
                         execution_error = Some(err);
                     }
                 }
@@ -404,10 +410,11 @@ where
                     ?execution_error,
                     "Executed order"
                 );
+                result.push(tx);
             }
         }
 
-        Ok(())
+        Ok(result)
     }
 
     fn fill_orders(

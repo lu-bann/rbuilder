@@ -89,6 +89,7 @@ fn bench_mevboost_sign(c: &mut Criterion) {
                 &payload,
                 H384::default(),
                 U256::default(),
+                None,
             )
             .unwrap();
         })
@@ -114,6 +115,7 @@ fn bench_mevboost_sign(c: &mut Criterion) {
                 &payload,
                 H384::default(),
                 U256::default(),
+                None,
             )
             .unwrap();
         })

@@ -3,6 +3,8 @@ pub mod fake_mev_boost_relay;
 pub mod rpc;
 pub mod sign_payload;
 
+use crate::primitives::proofs::InclusionProofs;
+
 use super::utils::u256decimal_serde_helper;
 
 use alloy_primitives::{Address, BlockHash, Bytes, U256};
@@ -453,7 +455,7 @@ impl RelayClient {
         ssz: bool,
         gzip: bool,
     ) -> Result<Response, SubmitBlockErr> {
-        let url = {
+        let mut url = {
             let mut url = self.url.clone();
             url.set_path("/relay/v1/builder/blocks");
             url
@@ -468,6 +470,10 @@ impl RelayClient {
                     SubmitBlockRequest::Capella(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::Deneb(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
+                    SubmitBlockRequest::DenebWithProofs(data) => {
+                        url.set_path("/relay/v1/builder/blocks_with_proofs");
+                        data.0.inner.as_ssz_bytes()
+                    }
                 },
                 SSZ_CONTENT_TYPE,
             )
@@ -610,11 +616,23 @@ impl DenebSubmitBlockRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CapellaSubmitBlockRequest(SignedBidSubmissionV2);
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DenebSubmitBlockWithProofsRequest(SignedBidSubmissionV3WithProofs);
+
+/// Submission for the `/relay/v1/builder/blocks_with_proofs` endpoint (Deneb).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignedBidSubmissionV3WithProofs {
+    pub inner: SignedBidSubmissionV3,
+    /// Merkle proofs
+    pub proofs: InclusionProofs,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum SubmitBlockRequest {
     Capella(CapellaSubmitBlockRequest),
     Deneb(DenebSubmitBlockRequest),
+    DenebWithProofs(DenebSubmitBlockWithProofsRequest),
     Electra(ElectraSubmitBlockRequest),
 }
 
@@ -623,6 +641,7 @@ impl SubmitBlockRequest {
         match self {
             SubmitBlockRequest::Capella(req) => req.0.message.clone(),
             SubmitBlockRequest::Deneb(req) => req.0.message.clone(),
+            SubmitBlockRequest::DenebWithProofs(req) => req.0.inner.message.clone(),
             SubmitBlockRequest::Electra(req) => req.0.message.clone(),
         }
     }

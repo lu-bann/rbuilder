@@ -1,8 +1,8 @@
 use super::{
-    CapellaSubmitBlockRequest, DenebSubmitBlockRequest, ElectraSubmitBlockRequest,
-    SubmitBlockRequest,
+    CapellaSubmitBlockRequest, DenebSubmitBlockRequest, DenebSubmitBlockWithProofsRequest,
+    ElectraSubmitBlockRequest, SignedBidSubmissionV3WithProofs, SubmitBlockRequest,
 };
-use crate::utils::u256decimal_serde_helper;
+use crate::{primitives::proofs::InclusionProofs, utils::u256decimal_serde_helper};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, BlockHash, Bytes, FixedBytes, B256, U256};
 use alloy_rpc_types_beacon::{
@@ -118,6 +118,7 @@ pub fn sign_block_for_relay(
     attrs: &PayloadAttributesData,
     pubkey: H384,
     value: U256,
+    inclusion_proofs: Option<InclusionProofs>,
 ) -> eyre::Result<SubmitBlockRequest> {
     let message = BidTrace {
         slot: attrs.proposal_slot,
@@ -198,13 +199,25 @@ pub fn sign_block_for_relay(
                 signature,
                 execution_requests: execution_requests.to_vec(),
             }))
-        } else {
+        } else if inclusion_proofs.is_none() {
             SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(SignedBidSubmissionV3 {
                 message,
                 execution_payload,
                 blobs_bundle,
                 signature,
             }))
+        } else {
+            SubmitBlockRequest::DenebWithProofs(DenebSubmitBlockWithProofsRequest(
+                SignedBidSubmissionV3WithProofs {
+                    inner: SignedBidSubmissionV3 {
+                        message,
+                        execution_payload,
+                        blobs_bundle,
+                        signature,
+                    },
+                    proofs: inclusion_proofs.unwrap(),
+                },
+            ))
         }
     } else {
         let execution_payload = capella_payload;

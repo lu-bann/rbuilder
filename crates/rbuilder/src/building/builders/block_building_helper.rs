@@ -48,6 +48,8 @@ pub trait BlockBuildingHelper: Send + Sync {
         constraint: &TransactionSignedEcRecoveredWithBlobs,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError>;
 
+    fn set_constraints(&mut self, constraints: Vec<TransactionSignedEcRecoveredWithBlobs>);
+
     /// Call set the trace fill_time (we still have to review this)
     fn set_trace_fill_time(&mut self, time: Duration);
     /// If not set the trace will default to creation time.
@@ -349,6 +351,10 @@ where
             },
             Err(e) => Err(e),
         }
+    }
+
+    fn set_constraints(&mut self, constraints: Vec<TransactionSignedEcRecoveredWithBlobs>) {
+        self.built_block_trace.slot_constraints = Some(constraints);
     }
 
     fn set_trace_fill_time(&mut self, time: Duration) {

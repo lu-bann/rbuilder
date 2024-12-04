@@ -1,5 +1,8 @@
 use super::{BundleErr, ExecutionError, ExecutionResult, OrderErr};
-use crate::primitives::{Order, OrderId, OrderReplacementKey};
+use crate::primitives::{
+    Order, OrderId, OrderReplacementKey,
+    TransactionSignedEcRecoveredWithBlobs,
+};
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, TxHash, U256};
 use std::{collections::hash_map, time::Duration};
@@ -11,6 +14,8 @@ use time::OffsetDateTime;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltBlockTrace {
     pub included_orders: Vec<ExecutionResult>,
+    /// slot_constraints if present
+    pub slot_constraints: Option<Vec<TransactionSignedEcRecoveredWithBlobs>>,
     /// How much we bid (pay to the validator)
     pub bid_value: U256,
     /// True block value (coinbase balance delta) excluding the cost of the payout to validator
@@ -56,6 +61,7 @@ impl BuiltBlockTrace {
             fill_time: Duration::from_secs(0),
             finalize_time: Duration::from_secs(0),
             root_hash_time: Duration::from_secs(0),
+            slot_constraints: None,
         }
     }
 
