@@ -8,6 +8,7 @@ use crate::{
         BlockBuildingContext,
     },
     live_builder::{payload_events::MevBoostSlotData, simulation::SlotOrderSimResults},
+    primitives::constraints::SignedConstraints,
     roothash::run_trie_prefetcher,
 };
 use reth_db::Database;
@@ -69,6 +70,7 @@ where
         block_ctx: BlockBuildingContext,
         global_cancellation: CancellationToken,
         max_time_to_build: Duration,
+        slot_constraints: Option<Vec<SignedConstraints>>,
     ) {
         let block_cancellation = global_cancellation.child_token();
 
@@ -78,6 +80,7 @@ where
             cancel.cancel();
         });
 
+        //  (receiver, sender)
         let (orders_for_block, sink) = OrdersForBlock::new_with_sink();
         // add OrderReplacementManager to manage replacements and cancellations
         let order_replacement_manager = OrderReplacementManager::new(Box::new(sink));
@@ -97,6 +100,7 @@ where
             payload,
             simulations_for_block,
             block_cancellation,
+            slot_constraints,
         );
     }
 
@@ -107,6 +111,7 @@ where
         slot_data: MevBoostSlotData,
         input: SlotOrderSimResults,
         cancel: CancellationToken,
+        slot_constraints: Option<Vec<SignedConstraints>>,
     ) {
         let builder_sink = self.sink_factory.create_sink(slot_data, cancel.clone());
         let (broadcast_input, _) = broadcast::channel(10_000);
@@ -124,8 +129,13 @@ where
                 cancel: cancel.clone(),
             };
             let builder = builder.clone();
+            let slot_constraints = slot_constraints.clone();
             tokio::task::spawn_blocking(move || {
-                builder.build_blocks(input);
+                if let Some(constraints) = &slot_constraints {
+                    builder.build_blocks_with_constraints(input, constraints.clone());
+                } else {
+                    builder.build_blocks(input);
+                }
                 debug!(block = block_number, builder_name, "Stopped builder job");
             });
         }

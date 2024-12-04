@@ -40,6 +40,7 @@ impl ConstraintSubscriber {
                             let received_constraints =
                                 serde_json::from_str::<Vec<SignedConstraints>>(data)
                                     .unwrap()
+                                    // NOTE: Its safe to pick first element because an event can only contain one constraint
                                     .first()
                                     .cloned()
                                     .expect("at least one constraint");

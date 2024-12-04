@@ -3,7 +3,7 @@ use crate::{
         BlockBuildingContext, BuiltBlockTrace, CriticalCommitOrderError, ExecutionError,
         ExecutionResult,
     },
-    primitives::SimulatedOrder,
+    primitives::{SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
 };
 use alloy_primitives::U256;
 use reth::revm::cached::CachedReads;
@@ -47,6 +47,13 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
         &mut self,
         _order: &SimulatedOrder,
     ) -> Result<Result<&ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
+        unimplemented!()
+    }
+
+    fn commit_constraint(
+        &mut self,
+        _constraint: &TransactionSignedEcRecoveredWithBlobs,
+    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
         unimplemented!()
     }
 

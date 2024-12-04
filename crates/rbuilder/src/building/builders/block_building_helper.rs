@@ -19,7 +19,7 @@ use crate::{
         EstimatePayoutGasErr, ExecutionError, ExecutionResult, FinalizeError, FinalizeResult,
         PartialBlock, Sorting,
     },
-    primitives::SimulatedOrder,
+    primitives::{SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
     roothash::RootHashConfig,
     telemetry,
 };
@@ -42,6 +42,11 @@ pub trait BlockBuildingHelper: Send + Sync {
         &mut self,
         order: &SimulatedOrder,
     ) -> Result<Result<&ExecutionResult, ExecutionError>, CriticalCommitOrderError>;
+
+    fn commit_constraint(
+        &mut self,
+        constraint: &TransactionSignedEcRecoveredWithBlobs,
+    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError>;
 
     /// Call set the trace fill_time (we still have to review this)
     fn set_trace_fill_time(&mut self, time: Duration);
@@ -309,6 +314,32 @@ where
                 Ok(res) => {
                     self.built_block_trace.add_included_order(res);
                     Ok(Ok(self.built_block_trace.included_orders.last().unwrap()))
+                }
+                Err(err) => {
+                    self.built_block_trace
+                        .modify_payment_when_no_signer_error(&err);
+                    Ok(Err(err))
+                }
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    fn commit_constraint(
+        &mut self,
+        constraint: &TransactionSignedEcRecoveredWithBlobs,
+    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
+        let result = self.partial_block.commit_constraint(
+            constraint,
+            &self.building_ctx,
+            &mut self.block_state,
+        );
+        match result {
+            Ok(ok_result) => match ok_result {
+                Ok(res) => {
+                    self.built_block_trace.add_included_order(res);
+                    let last_order = self.built_block_trace.included_orders.last().unwrap();
+                    Ok(Ok(last_order.to_owned()))
                 }
                 Err(err) => {
                     self.built_block_trace

@@ -997,6 +997,38 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
         })
     }
 
+    pub fn commit_constraint(
+        &mut self,
+        constraint: &TransactionSignedEcRecoveredWithBlobs,
+        ctx: &BlockBuildingContext,
+        cumulative_gas_used: u64,
+        gas_reserved: u64,
+        cumulative_blob_gas_used: u64,
+    ) -> Result<Result<TransactionOk, OrderErr>, CriticalCommitOrderError> {
+        self.execute_with_rollback(|s| {
+            let res = s.commit_tx(
+                constraint,
+                ctx,
+                cumulative_gas_used,
+                gas_reserved,
+                cumulative_blob_gas_used,
+            )?;
+            match res {
+                Ok(ok) => Ok(Ok(TransactionOk {
+                    exec_result: ok.exec_result,
+                    gas_used: ok.gas_used,
+                    cumulative_gas_used: ok.cumulative_gas_used,
+                    blob_gas_used: ok.blob_gas_used,
+                    cumulative_blob_gas_used: ok.cumulative_blob_gas_used,
+                    tx: ok.tx,
+                    nonce_updated: ok.nonce_updated,
+                    receipt: ok.receipt,
+                })),
+                Err(err) => Ok(Err(OrderErr::Transaction(err))),
+            }
+        })
+    }
+
     fn commit_order_no_rollback(
         &mut self,
         order: &Order,

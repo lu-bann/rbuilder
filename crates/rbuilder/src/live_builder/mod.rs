@@ -27,6 +27,7 @@ use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, B256};
 use building::BlockBuildingPool;
 use constraint_client::ConstraintSubscriber;
+use ethereum_consensus::configs::mainnet::SECONDS_PER_SLOT;
 use eyre::Context;
 use jsonrpsee::RpcModule;
 use order_input::ReplaceableOrderPoolCommand;
@@ -53,6 +54,8 @@ pub struct TimingsConfig {
     pub block_header_deadline_delta: time::Duration,
     /// Polling period while trying to get a block header
     pub get_block_header_period: time::Duration,
+    /// Time to wait for constraints to be received before building a block
+    pub receive_constraints_cuttoff_duration: Option<Duration>,
 }
 
 impl TimingsConfig {
@@ -62,6 +65,7 @@ impl TimingsConfig {
             slot_proposal_duration: Duration::from_secs(4),
             block_header_deadline_delta: time::Duration::milliseconds(-2500),
             get_block_header_period: time::Duration::milliseconds(250),
+            receive_constraints_cuttoff_duration: Some(Duration::from_secs(8)),
         }
     }
 
@@ -71,6 +75,7 @@ impl TimingsConfig {
             slot_proposal_duration: Duration::from_secs(0),
             block_header_deadline_delta: time::Duration::milliseconds(-25),
             get_block_header_period: time::Duration::milliseconds(25),
+            receive_constraints_cuttoff_duration: None,
         }
     }
 }
@@ -197,13 +202,16 @@ where
         let watchdog_sender = spawn_watchdog_thread(self.watchdog_timeout)?;
 
         let mut constraint_stream_channel = self.constraint_subscriber.unwrap().spawn();
-        tokio::spawn(async move {
-            while let Some(constraint) = constraint_stream_channel.recv().await {
-                self.constraint_store
-                    .write()
-                    .entry(constraint.message.slot)
-                    .or_default()
-                    .push(constraint);
+        tokio::spawn({
+            let constraint_store_clone = self.constraint_store.clone();
+            async move {
+                while let Some(constraint) = constraint_stream_channel.recv().await {
+                    constraint_store_clone
+                        .write()
+                        .entry(constraint.message.slot)
+                        .or_default()
+                        .push(constraint);
+                }
             }
         });
 
@@ -225,6 +233,26 @@ where
                 ?time_to_slot,
                 "Received payload, time till slot timestamp",
             );
+
+            // If we have a constraints cuttoff time, we should wait until it passes before
+            match timings.receive_constraints_cuttoff_duration {
+                Some(cuttoff_duration) => {
+                    let time_until_constraints_cuttoff =
+                        time_to_slot + (cuttoff_duration - Duration::from_secs(SECONDS_PER_SLOT));
+                    if time_until_constraints_cuttoff.is_negative() {
+                        debug!(
+                            slot = payload.slot(),
+                            "Constraints cuttoff time hasn't passed, sleeping for {}",
+                            time_until_constraints_cuttoff.as_seconds_f64()
+                        );
+                        tokio::time::sleep(Duration::from_secs_f64(
+                            time_until_constraints_cuttoff.as_seconds_f64(),
+                        ))
+                        .await;
+                    };
+                }
+                None => debug!("No constraints cuttoff time, proceeding with block building"),
+            };
 
             let time_until_slot_end = time_to_slot + timings.slot_proposal_duration;
             if time_until_slot_end.is_negative() {
@@ -268,10 +296,11 @@ where
                 None,
             ) {
                 builder_pool.start_block_building(
-                    payload,
+                    payload.clone(),
                     block_ctx,
                     self.global_cancellation.clone(),
                     time_until_slot_end.try_into().unwrap_or_default(),
+                    self.constraint_store.read().get(&payload.slot()).cloned(),
                 );
 
                 watchdog_sender.try_send(()).unwrap_or_default();

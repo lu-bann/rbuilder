@@ -19,7 +19,9 @@ use reth_primitives::BlockBody;
 use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
 
 use crate::{
-    primitives::{Order, OrderId, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
+    primitives::{
+        MempoolTx, Order, OrderId, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
+    },
     roothash::{calculate_state_root, RootHashConfig, RootHashError},
     utils::{a2r_withdrawal, calc_gas_limit, timestamp_as_u64, Signer},
 };
@@ -532,6 +534,63 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             inplace_sim: inplace_sim_result,
             gas_used: ok_result.gas_used,
             order: order.order.clone(),
+            txs: ok_result.txs,
+            original_order_ids: ok_result.original_order_ids,
+            receipts: ok_result.receipts,
+            nonces_updated: ok_result.nonces_updated,
+            paid_kickbacks: ok_result.paid_kickbacks,
+        }))
+    }
+
+    pub fn commit_constraint(
+        &mut self,
+        constraint: &TransactionSignedEcRecoveredWithBlobs,
+        ctx: &BlockBuildingContext,
+        state: &mut BlockState,
+    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
+        if ctx.builder_signer.is_none() {
+            // Return here to avoid wasting time on a call to fork.commit_order that 99% will fail
+            return Ok(Err(ExecutionError::OrderError(OrderErr::Bundle(
+                BundleErr::NoSigner,
+            ))));
+        }
+
+        // Wrap the constraint in a MempoolTx
+        let order = Order::Tx(MempoolTx::new(constraint.clone()));
+
+        let mut fork = PartialBlockFork::new(state).with_tracer(&mut self.tracer);
+        let exec_result = fork.commit_order(
+            &order,
+            ctx,
+            self.gas_used,
+            self.gas_reserved,
+            self.blob_gas_used,
+            self.discard_txs,
+        )?;
+        let ok_result = match exec_result {
+            Ok(ok) => ok,
+            Err(err) => {
+                return Ok(Err(err.into()));
+            }
+        };
+
+        let inplace_sim_result = SimValue::new(
+            ok_result.coinbase_profit,
+            ok_result.gas_used,
+            ok_result.blob_gas_used,
+            ok_result.paid_kickbacks.clone(),
+        );
+
+        self.gas_used += ok_result.gas_used;
+        self.blob_gas_used += ok_result.blob_gas_used;
+        self.coinbase_profit += ok_result.coinbase_profit;
+        self.executed_tx.extend(ok_result.txs.clone());
+        self.receipts.extend(ok_result.receipts.clone());
+        Ok(Ok(ExecutionResult {
+            coinbase_profit: ok_result.coinbase_profit,
+            inplace_sim: inplace_sim_result,
+            gas_used: ok_result.gas_used,
+            order: order.clone(),
             txs: ok_result.txs,
             original_order_ids: ok_result.original_order_ids,
             receipts: ok_result.receipts,

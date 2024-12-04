@@ -7,7 +7,7 @@ pub mod parallel_builder;
 use crate::{
     building::{BlockBuildingContext, BlockOrders, BuiltBlockTrace, SimulatedOrderSink, Sorting},
     live_builder::{payload_events::MevBoostSlotData, simulation::SimulatedOrderCommand},
-    primitives::{AccountNonce, OrderId, SimulatedOrder},
+    primitives::{constraints::SignedConstraints, AccountNonce, OrderId, SimulatedOrder},
     roothash::RootHashConfig,
     utils::{is_provider_factory_health_error, NonceCache},
 };
@@ -219,6 +219,12 @@ where
 {
     fn name(&self) -> String;
     fn build_blocks(&self, input: BlockBuildingAlgorithmInput<P>);
+    fn build_blocks_with_constraints(
+        &self,
+        _input: BlockBuildingAlgorithmInput<P>,
+        _slot_constraints: Vec<SignedConstraints>,
+    ) {
+    }
 }
 
 /// Factory used to create UnfinishedBlockBuildingSink for builders.
