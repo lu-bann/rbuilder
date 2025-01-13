@@ -4,9 +4,13 @@ edition = "2021"
 
 [dependencies]
 # workspace
+rbuilder = { path = "../../rbuilder" }
 op-rbuilder-payload-builder = { path = "../payload_builder" }
 transaction-pool-bundle-ext = { path = "../../transaction-pool-bundle-ext" }
 rbuilder-bundle-pool-operations = { path = "../../transaction-pool-bundle-ext/bundle_pool_ops/rbuilder" }
+
+# alloy
+alloy-consensus.workspace = true
 
 # reth
 reth-payload-builder.workspace = true
@@ -37,5 +41,5 @@ optimism = [
 	"reth-optimism-node/optimism",
 	"reth-primitives/optimism",
 	"reth-provider/optimism",
-	"op-rbuilder-payload-builder/optimism"
+	"op-rbuilder-payload-builder/optimism",
 ]

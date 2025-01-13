@@ -18,7 +18,7 @@ use rbuilder::{
     },
     live_builder::{
         base_config::{
-            DEFAULT_EL_NODE_IPC_PATH, DEFAULT_INCOMING_BUNDLES_PORT, DEFAULT_IP,
+            default_ip, DEFAULT_EL_NODE_IPC_PATH, DEFAULT_INCOMING_BUNDLES_PORT,
             DEFAULT_RETH_DB_PATH,
         },
         config::create_provider_factory,
@@ -34,14 +34,13 @@ use rbuilder::{
         mev_boost::{MevBoostRelay, RelayConfig},
         SimulatedOrder,
     },
-    roothash::RootHashConfig,
+    provider::StateProviderFactory,
     utils::{ProviderFactoryReopener, Signer},
 };
 use reth_chainspec::MAINNET;
-use reth_db::{database::Database, DatabaseEnv};
+use reth_db::DatabaseEnv;
 use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_ethereum::EthereumNode;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
 use tokio::{
     signal::ctrl_c,
     sync::{broadcast, mpsc},
@@ -78,9 +77,9 @@ async fn main() -> eyre::Result<()> {
     let order_input_config = OrderInputConfig::new(
         false,
         true,
-        DEFAULT_EL_NODE_IPC_PATH.parse().unwrap(),
+        Some(PathBuf::from(DEFAULT_EL_NODE_IPC_PATH)),
         DEFAULT_INCOMING_BUNDLES_PORT,
-        *DEFAULT_IP,
+        default_ip(),
         DEFAULT_SERVE_MAX_CONNECTIONS,
         DEFAULT_RESULTS_CHANNEL_TIMEOUT,
         DEFAULT_INPUT_CHANNEL_BUFFER_SIZE,
@@ -89,10 +88,9 @@ async fn main() -> eyre::Result<()> {
         mpsc::channel(order_input_config.input_channel_buffer_size);
     let builder = LiveBuilder::<
         ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
-        Arc<DatabaseEnv>,
         MevBoostSlotDataGenerator,
     > {
-        watchdog_timeout: Duration::from_secs(10000),
+        watchdog_timeout: Some(Duration::from_secs(10000)),
         error_storage_path: None,
         simulation_threads: 1,
         blocks_source: payload_event,
@@ -103,6 +101,7 @@ async fn main() -> eyre::Result<()> {
             None,
             None,
             chain_spec.clone(),
+            None,
         )?,
         coinbase_signer: Signer::random(),
         extra_data: Vec::new(),
@@ -114,6 +113,7 @@ async fn main() -> eyre::Result<()> {
         run_sparse_trie_prefetcher: false,
         orderpool_sender,
         orderpool_receiver,
+        sbundle_merger_selected_signers: Default::default(),
         constraint_subscriber: None,
         constraint_store: Default::default(),
     };
@@ -200,22 +200,17 @@ impl DummyBuildingAlgorithm {
         }
     }
 
-    fn build_block<P, DB>(
+    fn build_block<P>(
         &self,
         orders: Vec<SimulatedOrder>,
         provider: P,
         ctx: &BlockBuildingContext,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>>
     where
-        DB: Database + Clone + 'static,
-        P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-            + StateProviderFactory
-            + Clone
-            + 'static,
+        P: StateProviderFactory + Clone + 'static,
     {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             provider.clone(),
-            RootHashConfig::live_config(false, false),
             ctx.clone(),
             None,
             BUILDER_NAME.to_string(),
@@ -232,13 +227,9 @@ impl DummyBuildingAlgorithm {
     }
 }
 
-impl<P, DB> BlockBuildingAlgorithm<P, DB> for DummyBuildingAlgorithm
+impl<P> BlockBuildingAlgorithm<P> for DummyBuildingAlgorithm
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     fn name(&self) -> String {
         BUILDER_NAME.to_string()

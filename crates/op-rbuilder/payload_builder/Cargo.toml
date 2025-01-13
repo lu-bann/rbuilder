@@ -6,6 +6,7 @@ description = "A payload builder for op-rbuilder with bundle support."
 
 [dependencies]
 # workspace
+rbuilder = { path = "../../rbuilder" }
 transaction-pool-bundle-ext = { path = "../../transaction-pool-bundle-ext" }
 
 # reth
@@ -43,9 +44,8 @@ optimism = [
 	"reth-execution-types/optimism",
 	"reth-optimism-evm/optimism",
 	"reth-optimism-node/optimism",
-	"reth-optimism-payload-builder/optimism",
 	"reth-primitives/optimism",
 	"reth-provider/optimism",
 	"revm/optimism",
-	"reth-optimism-consensus/optimism"
+	"reth-optimism-consensus/optimism",
 ]

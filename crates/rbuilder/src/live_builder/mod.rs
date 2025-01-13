@@ -19,11 +19,15 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
+    provider::StateProviderFactory,
     primitives::constraints::SignedConstraints,
     telemetry::inc_active_slots,
-    utils::{error_storage::spawn_error_storage_writer, Signer},
+    utils::{
+        error_storage::spawn_error_storage_writer, provider_head_state::ProviderHeadState, Signer,
+    },
 };
 use ahash::{HashMap, HashSet};
+use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use building::BlockBuildingPool;
 use constraint_client::ConstraintSubscriber;
@@ -33,10 +37,7 @@ use jsonrpsee::RpcModule;
 use order_input::ReplaceableOrderPoolCommand;
 use parking_lot::RwLock;
 use payload_events::MevBoostSlotData;
-use reth::{primitives::Header, providers::HeaderProvider};
 use reth_chainspec::ChainSpec;
-use reth_db::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
 use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -85,18 +86,21 @@ pub trait SlotSource {
     fn recv_slot_channel(self) -> mpsc::UnboundedReceiver<MevBoostSlotData>;
 }
 
+/// Max headers sent to the cleaning task before the main loop blocks.
+/// Cleaning task is super fast so it should never lag behind block building, even 1 should be enough, 10 is super safe.
+const CLEAN_TASKS_CHANNEL_SIZE: usize = 10;
+
 /// Main builder struct.
 /// Connects to the CL, get the new slots and builds blocks for each slot.
 /// # Usage
 /// Create and run()
 #[derive(Debug)]
-pub struct LiveBuilder<P, DB, BlocksSourceType>
+pub struct LiveBuilder<P, BlocksSourceType>
 where
-    DB: Database + Clone + 'static,
-    P: StateProviderFactory + Clone,
+    P: StateProviderFactory,
     BlocksSourceType: SlotSource,
 {
-    pub watchdog_timeout: Duration,
+    pub watchdog_timeout: Option<Duration>,
     pub error_storage_path: Option<PathBuf>,
     pub simulation_threads: usize,
     pub order_input_config: OrderInputConfig,
@@ -113,12 +117,13 @@ where
     pub global_cancellation: CancellationToken,
 
     pub sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
-    pub builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>,
+    pub builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>,
     pub extra_rpc: RpcModule<()>,
 
     /// Notify rbuilder of new [`ReplaceableOrderPoolCommand`] flow via this channel.
     pub orderpool_sender: mpsc::Sender<ReplaceableOrderPoolCommand>,
     pub orderpool_receiver: mpsc::Receiver<ReplaceableOrderPoolCommand>,
+    pub sbundle_merger_selected_signers: Arc<Vec<Address>>,
 
     /// constraint stream subsciber
     pub constraint_subscriber: Option<ConstraintSubscriber>,
@@ -126,21 +131,16 @@ where
     pub constraint_store: Arc<RwLock<HashMap<u64, Vec<SignedConstraints>>>>,
 }
 
-impl<P, DB, BlocksSourceType: SlotSource> LiveBuilder<P, DB, BlocksSourceType>
+impl<P, BlocksSourceType: SlotSource> LiveBuilder<P, BlocksSourceType>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + HeaderProvider
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
     BlocksSourceType: SlotSource,
 {
     pub fn with_extra_rpc(self, extra_rpc: RpcModule<()>) -> Self {
         Self { extra_rpc, ..self }
     }
 
-    pub fn with_builders(self, builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>) -> Self {
+    pub fn with_builders(self, builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>) -> Self {
         Self { builders, ..self }
     }
 
@@ -168,6 +168,8 @@ where
         let mut inner_jobs_handles = Vec::new();
         let mut payload_events_channel = self.blocks_source.recv_slot_channel();
 
+        let (header_sender, header_receiver) = mpsc::channel(CLEAN_TASKS_CHANNEL_SIZE);
+
         let orderpool_subscriber = {
             let (handle, sub) = start_orderpool_jobs(
                 self.order_input_config,
@@ -176,6 +178,7 @@ where
                 self.global_cancellation.clone(),
                 self.orderpool_sender,
                 self.orderpool_receiver,
+                header_receiver,
             )
             .await?;
             inner_jobs_handles.push(handle);
@@ -197,9 +200,19 @@ where
             orderpool_subscriber,
             order_simulation_pool,
             self.run_sparse_trie_prefetcher,
+            self.sbundle_merger_selected_signers.clone(),
         );
 
-        let watchdog_sender = spawn_watchdog_thread(self.watchdog_timeout)?;
+        let watchdog_sender = match self.watchdog_timeout {
+            Some(duration) => Some(spawn_watchdog_thread(
+                duration,
+                "block build started".to_string(),
+            )?),
+            None => {
+                info!("Watchdog not enabled");
+                None
+            }
+        };
 
         let mut constraint_stream_channel = self.constraint_subscriber.unwrap().spawn();
         tokio::spawn({
@@ -224,13 +237,17 @@ where
                 );
                 continue;
             }
+            let current_time = OffsetDateTime::now_utc();
             // see if we can get parent header in a reasonable time
-
-            let time_to_slot = payload.timestamp() - OffsetDateTime::now_utc();
+            let time_to_slot = payload.timestamp() - current_time;
             debug!(
                 slot = payload.slot(),
                 block = payload.block(),
+                ?current_time,
+                payload_timestamp = ?payload.timestamp(),
                 ?time_to_slot,
+                parent_hash = ?payload.parent_block_hash(),
+                provider_head_state = ?ProviderHeadState::new(&self.provider),
                 "Received payload, time till slot timestamp",
             );
 
@@ -258,6 +275,7 @@ where
             if time_until_slot_end.is_negative() {
                 warn!(
                     slot = payload.slot(),
+                    parent_hash = ?payload.parent_block_hash(),
                     "Slot already ended, skipping block building"
                 );
                 continue;
@@ -271,7 +289,7 @@ where
                 {
                     Ok(header) => header,
                     Err(err) => {
-                        warn!("Failed to get parent header for new slot: {:?}", err);
+                        warn!(parent_hash = ?payload.parent_block_hash(),"Failed to get parent header for new slot: {:?}", err);
                         continue;
                     }
                 }
@@ -280,10 +298,18 @@ where
             debug!(
                 slot = payload.slot(),
                 block = payload.block(),
+                parent_hash = ?payload.parent_block_hash(),
                 "Got header for slot"
             );
 
+            // notify the order pool that there is a new header
+            if let Err(err) = header_sender.send(parent_header.clone()).await {
+                warn!("Failed to send header to builder pool: {:?}", err);
+            }
+
             inc_active_slots();
+
+            let root_hasher = Arc::from(self.provider.root_hasher(payload.parent_block_hash()));
 
             if let Some(block_ctx) = BlockBuildingContext::from_attributes(
                 payload.payload_attributes_event.clone(),
@@ -294,6 +320,7 @@ where
                 Some(payload.suggested_gas_limit),
                 self.extra_data.clone(),
                 None,
+                root_hasher,
             ) {
                 builder_pool.start_block_building(
                     payload.clone(),
@@ -303,7 +330,9 @@ where
                     self.constraint_store.read().get(&payload.slot()).cloned(),
                 );
 
-                watchdog_sender.try_send(()).unwrap_or_default();
+                if let Some(watchdog_sender) = watchdog_sender.as_ref() {
+                    watchdog_sender.try_send(()).unwrap_or_default();
+                };
             }
         }
 
@@ -334,11 +363,11 @@ where
 async fn wait_for_block_header<P>(
     block: B256,
     slot_time: OffsetDateTime,
-    provider: P,
+    provider: &P,
     timings: &TimingsConfig,
 ) -> eyre::Result<Header>
 where
-    P: HeaderProvider,
+    P: StateProviderFactory,
 {
     let deadline = slot_time + timings.block_header_deadline_delta;
     while OffsetDateTime::now_utc() < deadline {

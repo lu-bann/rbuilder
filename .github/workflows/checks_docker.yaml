@@ -1,15 +1,16 @@
-name: Nightly Docker Build
+name: Docker Build
 
 on:
-  schedule:
-    # Runs at 00:00 UTC every day
-    - cron: "0 0 * * *"
-  workflow_dispatch: # Allows manual triggering
+  workflow_dispatch:
+  pull_request:
+  merge_group:
+  push:
+    branches: [develop]
 
 jobs:
   build-docker:
     name: Build Docker image
-    runs-on: warp-ubuntu-latest-x64-16x
+    runs-on: warp-ubuntu-latest-x64-32x
 
     steps:
       - name: Checkout sources

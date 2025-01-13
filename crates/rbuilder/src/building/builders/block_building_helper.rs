@@ -1,13 +1,9 @@
-use std::{
-    cmp::max,
-    marker::PhantomData,
-    time::{Duration, Instant},
-};
-
 use alloy_primitives::{utils::format_ether, U256};
 use reth::revm::cached::CachedReads;
-use reth_db::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
+use std::{
+    cmp::max,
+    time::{Duration, Instant},
+};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
@@ -20,8 +16,9 @@ use crate::{
         PartialBlock, Sorting,
     },
     primitives::{SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
-    roothash::RootHashConfig,
+    provider::StateProviderFactory,
     telemetry,
+    utils::{check_block_hash_reader_health, HistoricalBlockError},
 };
 
 use super::Block;
@@ -83,17 +80,17 @@ pub trait BlockBuildingHelper: Send + Sync {
 
     /// Updates the cached reads for the block state.
     fn update_cached_reads(&mut self, cached_reads: CachedReads);
+
+    /// Name of the builder that pregenerated this block.
+    /// BE CAREFUL: Might be ambiguous if several building parts were involved...
+    fn builder_name(&self) -> &str;
 }
 
 /// Implementation of BlockBuildingHelper based on a generic Provider
 #[derive(Clone)]
-pub struct BlockBuildingHelperFromProvider<P, DB>
+pub struct BlockBuildingHelperFromProvider<P>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory,
 {
     /// Balance of fee recipient before we stared building.
     _fee_recipient_balance_start: U256,
@@ -110,10 +107,8 @@ where
     built_block_trace: BuiltBlockTrace,
     /// Needed to get the initial state and the final root hash calculation.
     provider: P,
-    root_hash_config: RootHashConfig,
     /// Token to cancel in case of fatal error (if we believe that it's impossible to build for this block).
     cancel_on_fatal_error: CancellationToken,
-    phantom: PhantomData<DB>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +127,8 @@ pub enum BlockBuildingHelperError {
     FinalizeError(#[from] FinalizeError),
     #[error("Payout tx not allowed for block")]
     PayoutTxNotAllowed,
+    #[error("Provider historical block hashes error: {0}")]
+    HistoricalBlockError(#[from] HistoricalBlockError),
 }
 
 impl BlockBuildingHelperError {
@@ -155,13 +152,9 @@ pub struct FinalizeBlockResult {
     pub cached_reads: CachedReads,
 }
 
-impl<P, DB> BlockBuildingHelperFromProvider<P, DB>
+impl<P> BlockBuildingHelperFromProvider<P>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     /// allow_tx_skip: see [`PartialBlockFork`]
     /// Performs initialization:
@@ -171,7 +164,6 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: P,
-        root_hash_config: RootHashConfig,
         building_ctx: BlockBuildingContext,
         cached_reads: Option<CachedReads>,
         builder_name: String,
@@ -181,6 +173,10 @@ where
     ) -> Result<Self, BlockBuildingHelperError> {
         // @Maybe an issue - we have 2 db txs here (one for hash and one for finalize)
         let state_provider = provider.history_by_block_hash(building_ctx.attributes.parent)?;
+
+        let last_committed_block = building_ctx.block() - 1;
+        check_block_hash_reader_health(last_committed_block, &state_provider)?;
+
         let fee_recipient_balance_start = state_provider
             .account_balance(building_ctx.attributes.suggested_fee_recipient)?
             .unwrap_or_default();
@@ -203,6 +199,7 @@ where
             partial_block.reserve_gas(payout_tx_gas);
             Some(payout_tx_gas)
         };
+
         Ok(Self {
             _fee_recipient_balance_start: fee_recipient_balance_start,
             block_state,
@@ -212,9 +209,7 @@ where
             building_ctx,
             built_block_trace: BuiltBlockTrace::new(),
             provider,
-            root_hash_config,
             cancel_on_fatal_error,
-            phantom: PhantomData,
         })
     }
 
@@ -295,13 +290,9 @@ where
     }
 }
 
-impl<P, DB> BlockBuildingHelper for BlockBuildingHelperFromProvider<P, DB>
+impl<P> BlockBuildingHelper for BlockBuildingHelperFromProvider<P>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     /// Forwards to partial_block and updates trace.
     fn commit_order(
@@ -395,12 +386,10 @@ where
 
         let sim_gas_used = self.partial_block.tracer.used_gas;
         let block_number = self.building_context().block();
-        let finalized_block = match self.partial_block.finalize(
-            &mut self.block_state,
-            &self.building_ctx,
-            self.provider.clone(),
-            self.root_hash_config,
-        ) {
+        let finalized_block = match self
+            .partial_block
+            .finalize(&mut self.block_state, &self.building_ctx)
+        {
             Ok(finalized_block) => finalized_block,
             Err(err) => {
                 if err.is_consistent_db_view_err() {
@@ -458,5 +447,9 @@ where
 
     fn update_cached_reads(&mut self, cached_reads: CachedReads) {
         self.block_state = self.block_state.clone().with_cached_reads(cached_reads);
+    }
+
+    fn builder_name(&self) -> &str {
+        &self.builder_name
     }
 }

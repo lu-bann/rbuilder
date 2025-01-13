@@ -10,31 +10,29 @@ pub mod payout_tx;
 pub mod sim;
 pub mod testing;
 pub mod tracers;
-use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
+use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::{Address, Bytes, Sealable, U256};
-pub use block_orders::BlockOrders;
-use eth_sparse_mpt::SparseTrieSharedCache;
-use reth_db::Database;
+use builders::mock_block_building_helper::MockRootHasher;
 use reth_primitives::BlockBody;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
 
 use crate::{
     primitives::{
         MempoolTx, Order, OrderId, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
     },
-    roothash::{calculate_state_root, RootHashConfig, RootHashError},
+    provider::RootHasher,
+    roothash::RootHashError,
     utils::{a2r_withdrawal, calc_gas_limit, timestamp_as_u64, Signer},
 };
 use ahash::HashSet;
-use alloy_eips::{calc_excess_blob_gas, eip7685::Requests, merge::BEACON_NONCE};
+use alloy_eips::{
+    calc_excess_blob_gas, eip4844::BlobTransactionSidecar, eip4895::Withdrawals, eip7685::Requests,
+    merge::BEACON_NONCE,
+};
 use alloy_rpc_types_beacon::events::PayloadAttributesEvent;
 use jsonrpsee::core::Serialize;
 use reth::{
     payload::PayloadId,
-    primitives::{
-        proofs, revm_primitives::InvalidTransaction, BlobTransactionSidecar, Block, Head, Header,
-        Receipt, Receipts, SealedBlock, Withdrawals,
-    },
+    primitives::{proofs, Block, Head, Receipt, Receipts, SealedBlock},
     providers::ExecutionOutcome,
     revm::cached::CachedReads,
 };
@@ -49,6 +47,7 @@ use revm::{
     db::states::bundle_state::BundleRetention,
     primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnvWithHandlerCfg, SpecId},
 };
+use revm_primitives::InvalidTransaction;
 use serde::Deserialize;
 use std::{
     hash::Hash,
@@ -86,7 +85,7 @@ pub struct BlockBuildingContext {
     pub excess_blob_gas: Option<u64>,
     /// Version of the EVM that we are going to use
     pub spec_id: SpecId,
-    pub shared_sparse_mpt_cache: SparseTrieSharedCache,
+    pub root_hasher: Arc<dyn RootHasher>,
 }
 
 impl BlockBuildingContext {
@@ -102,6 +101,7 @@ impl BlockBuildingContext {
         prefer_gas_limit: Option<u64>,
         extra_data: Vec<u8>,
         spec_id: Option<SpecId>,
+        root_hasher: Arc<dyn RootHasher>,
     ) -> Option<BlockBuildingContext> {
         let attributes = EthPayloadBuilderAttributes::try_new(
             attributes.data.parent_block_hash,
@@ -164,10 +164,11 @@ impl BlockBuildingContext {
             extra_data,
             excess_blob_gas,
             spec_id,
-            shared_sparse_mpt_cache: Default::default(),
+            root_hasher,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// `from_block_data` is used to create `BlockBuildingContext` from onchain block for backtest purposes
     /// spec_id None: we use the SpecId for the block.
     /// Note: We calculate SpecId based on the current block instead of the parent block so this will break for the blocks +-1 relative to the fork
@@ -179,6 +180,7 @@ impl BlockBuildingContext {
         coinbase: Address,
         suggested_fee_recipient: Address,
         builder_signer: Option<Signer>,
+        root_hasher: Arc<dyn RootHasher>,
     ) -> BlockBuildingContext {
         let block_number = onchain_block.header.number;
 
@@ -195,7 +197,7 @@ impl BlockBuildingContext {
             coinbase,
             timestamp: U256::from(onchain_block.header.timestamp),
             difficulty: onchain_block.header.difficulty,
-            prevrandao: onchain_block.header.mix_hash,
+            prevrandao: Some(onchain_block.header.mix_hash),
             basefee: U256::from(
                 onchain_block
                     .header
@@ -221,7 +223,7 @@ impl BlockBuildingContext {
             parent: onchain_block.header.parent_hash,
             timestamp: timestamp_as_u64(&onchain_block),
             suggested_fee_recipient,
-            prev_randao: onchain_block.header.mix_hash.unwrap_or_default(),
+            prev_randao: onchain_block.header.mix_hash,
             withdrawals,
             parent_beacon_block_root: onchain_block.header.parent_beacon_block_root,
         };
@@ -249,7 +251,7 @@ impl BlockBuildingContext {
             extra_data: Vec::new(),
             excess_blob_gas: onchain_block.header.excess_blob_gas,
             spec_id,
-            shared_sparse_mpt_cache: Default::default(),
+            root_hasher,
         }
     }
 
@@ -265,6 +267,7 @@ impl BlockBuildingContext {
             Default::default(),
             Default::default(),
             Default::default(),
+            Arc::new(MockRootHasher {}),
         )
     }
 
@@ -655,20 +658,11 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
 
     /// Mostly based on reth's (v1.1.1) default_ethereum_payload_builder.
     #[allow(clippy::too_many_arguments)]
-    pub fn finalize<P, DB>(
+    pub fn finalize(
         self,
         state: &mut BlockState,
         ctx: &BlockBuildingContext,
-        provider: P,
-        root_hash_config: RootHashConfig,
-    ) -> Result<FinalizeResult, FinalizeError>
-    where
-        DB: Database + Clone + 'static,
-        P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-            + StateProviderFactory
-            + Clone
-            + 'static,
-    {
+    ) -> Result<FinalizeResult, FinalizeError> {
         let requests = if ctx
             .chain_spec
             .is_prague_active_at_timestamp(ctx.attributes.timestamp())
@@ -748,13 +742,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
 
         // calculate the state root
         let start = Instant::now();
-        let state_root = calculate_state_root(
-            provider,
-            ctx.attributes.parent,
-            &execution_outcome,
-            ctx.shared_sparse_mpt_cache.clone(),
-            root_hash_config,
-        )?;
+        let state_root = ctx.root_hasher.state_root(&execution_outcome)?;
         let root_hash_time = start.elapsed();
 
         // create the block header

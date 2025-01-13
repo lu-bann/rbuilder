@@ -8,12 +8,13 @@ use crate::{
     },
     live_builder::order_input::orderpool::OrdersForBlock,
     primitives::{OrderId, SimulatedOrder},
-    utils::gen_uid,
+    provider::StateProviderFactory,
+    utils::{gen_uid, Signer},
 };
 use ahash::HashMap;
-use reth_provider::StateProviderFactory;
+use parking_lot::Mutex;
 use simulation_job::SimulationJob;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{info_span, Instrument};
@@ -94,7 +95,7 @@ where
     }
 
     /// Prepares the context to run a SimulationJob and spawns a task with it.
-    /// The returned SlotOrderSimResults can be polled to the the simulation stream.
+    /// The returned SlotOrderSimResults can be polled to the simulation stream.
     /// IMPORTANT: By calling spawn_simulation_job we lock some worker threads on the given block.
     ///     When we are done we MUST call block_cancellation so the threads can be freed for the next block.
     /// @Pending: Not properly working to be used with several blocks at the same time (forks!).
@@ -105,6 +106,15 @@ where
         block_cancellation: CancellationToken,
     ) -> SlotOrderSimResults {
         let (slot_sim_results_sender, slot_sim_results_receiver) = mpsc::channel(10_000);
+
+        let ctx = {
+            // use random coinbase for simulations to make top of the block simulation bypass harder
+            let mut ctx = ctx;
+            let signer = Signer::random();
+            ctx.block_env.coinbase = signer.address;
+            ctx.builder_signer = Some(signer);
+            ctx
+        };
 
         let provider = self.provider.clone();
         let current_contexts = Arc::clone(&self.current_contexts);
@@ -118,7 +128,7 @@ where
                 let (sim_req_sender, sim_req_receiver) = flume::unbounded();
                 let (sim_results_sender, sim_results_receiver) = mpsc::channel(1024);
                 {
-                    let mut contexts = current_contexts.lock().unwrap();
+                    let mut contexts = current_contexts.lock();
                     let sim_context = SimulationContext {
                         block_ctx: ctx,
                         requests: sim_req_receiver,
@@ -139,7 +149,7 @@ where
 
                 // clean up
                 {
-                    let mut contexts = current_contexts.lock().unwrap();
+                    let mut contexts = current_contexts.lock();
                     contexts.contexts.remove(&block_context);
                 }
             }
@@ -147,7 +157,7 @@ where
         );
 
         {
-            let mut tasks = self.running_tasks.lock().unwrap();
+            let mut tasks = self.running_tasks.lock();
             tasks.retain(|handle| !handle.is_finished());
             tasks.push(handle);
         }
@@ -175,9 +185,11 @@ mod tests {
 
         // Create simulation core
         let cancel = CancellationToken::new();
-        let provider_factory_reopener =
-            ProviderFactoryReopener::new_from_existing(test_context.provider_factory().clone())
-                .unwrap();
+        let provider_factory_reopener = ProviderFactoryReopener::new_from_existing(
+            test_context.provider_factory().clone(),
+            None,
+        )
+        .unwrap();
 
         let sim_pool = OrderSimulationPool::new(provider_factory_reopener, 4, cancel.clone());
         let (order_sender, order_receiver) = mpsc::unbounded_channel();
