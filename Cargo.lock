@@ -835,11 +835,12 @@ dependencies = [
 
 [[package]]
 name = "anstyle-wincon"
-version = "3.0.6"
+version = "3.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2109dbce0e72be3ec00bed26e6a7479ca384ad226efdd66db8fa2e3a38c83125"
+checksum = "ca3534e77181a9cc07539ad51f2141fe32f6c3ffd4df76db8ad92346b003ae4e"
 dependencies = [
  "anstyle",
+ "once_cell",
  "windows-sys 0.59.0",
 ]
 
@@ -1207,9 +1208,9 @@ dependencies = [
 
 [[package]]
 name = "auto_impl"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c87f3f15e7794432337fc718554eaa4dc8f04c9677a950ffe366f20a162ae42"
+checksum = "e12882f59de5360c748c4cbf569a042d5fb0eb515f7bea9c1f470b47f6ffbd73"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1292,7 +1293,7 @@ checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
 [[package]]
 name = "beacon-api-client"
 version = "0.1.0"
-source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=multi-proofs#f42a70991a011f9ae45a038bde2e58f10ed8edac"
+source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=multi-proofs#11a3b9000a5eb90e5c8d0713a51e75aa85559c0d"
 dependencies = [
  "clap 4.5.26",
  "ethereum-consensus",
@@ -3104,7 +3105,7 @@ dependencies = [
 [[package]]
 name = "ethereum-consensus"
 version = "0.1.1"
-source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=multi-proofs#f42a70991a011f9ae45a038bde2e58f10ed8edac"
+source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=multi-proofs#11a3b9000a5eb90e5c8d0713a51e75aa85559c0d"
 dependencies = [
  "blst",
  "bs58 0.4.0",
@@ -5772,9 +5773,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ffbe83022cedc1d264172192511ae958937694cd57ce297164951b8b3568394"
+checksum = "b8402cab7aefae129c6977bb0ff1b8fd9a04eb5b51efc50a70bea51cda0c7924"
 dependencies = [
  "adler2",
 ]
@@ -7692,9 +7693,9 @@ dependencies = [
 
 [[package]]
 name = "raw-cpuid"
-version = "11.2.0"
+version = "11.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ab240315c661615f2ee9f0f2cd32d5a7343a84d5ebcccb99d46e6637565e7b0"
+checksum = "c6928fa44c097620b706542d428957635951bade7143269085389d42c8a4927e"
 dependencies = [
  "bitflags 2.7.0",
 ]
@@ -12231,7 +12232,7 @@ dependencies = [
 [[package]]
 name = "ssz_rs"
 version = "0.9.0"
-source = "git+https://github.com/lu-bann/ssz-rs.git?branch=multi-proofs#e847aedd9eb5310187fac9b3dab3c99f6c31793f"
+source = "git+https://github.com/lu-bann/ssz-rs.git?branch=multi_proofs#868112226f48cef5566f913417a5069744415d58"
 dependencies = [
  "alloy-primitives",
  "bitvec",
@@ -12243,7 +12244,7 @@ dependencies = [
 [[package]]
 name = "ssz_rs_derive"
 version = "0.9.0"
-source = "git+https://github.com/lu-bann/ssz-rs.git?branch=multi-proofs#e847aedd9eb5310187fac9b3dab3c99f6c31793f"
+source = "git+https://github.com/lu-bann/ssz-rs.git?branch=multi_proofs#868112226f48cef5566f913417a5069744415d58"
 dependencies = [
  "proc-macro2",
  "quote",

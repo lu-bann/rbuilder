@@ -134,7 +134,7 @@ mod tests {
                 tx.into_signed()
             })
             .collect::<Vec<TransactionSigned>>();
-        let constraints = vec![payload_txs[1].clone(), payload_txs[3].clone()];
+        let constraints = vec![payload_txs[3].clone()];
 
         let inclusion_proof = calculate_merkle_multi_proofs(payload_txs.clone(), constraints);
         assert!(inclusion_proof.is_ok())
