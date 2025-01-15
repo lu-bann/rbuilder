@@ -1,8 +1,16 @@
 use std::{
     io,
+    net::SocketAddr,
     path::PathBuf,
     process::{Child, Command},
+    time::Duration,
 };
+
+use axum::routing::get;
+use futures::StreamExt;
+use tokio::sync::broadcast;
+
+use crate::primitives::constraints::SignedConstraints;
 
 #[derive(Debug)]
 pub enum FakeMevBoostRelayError {
@@ -84,8 +92,87 @@ impl Drop for FakeMevBoostRelayInstance {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PreconfRelay {
+    constraints_handle: ConstraintsHandle,
+}
+
+impl PreconfRelay {
+    pub fn new() -> Self {
+        let constraints_tx = broadcast::channel(128).0;
+        let constraints_handle = ConstraintsHandle { constraints_tx };
+        Self { constraints_handle }
+    }
+}
+
+pub struct PreconfRelayServer {
+    /// The address to bind the server to
+    addr: SocketAddr,
+}
+
+impl PreconfRelayServer {
+    pub fn new(addr: SocketAddr) -> Self {
+        Self { addr }
+    }
+
+    pub fn spawn(self) {
+        let relay = PreconfRelay::new();
+        let router = axum::Router::new()
+            .route("/constraint_stream", get(constraints_stream))
+            .with_state(relay);
+
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(self.addr).await.unwrap();
+            axum::serve(listener, router).await.unwrap();
+        });
+    }
+}
+
+pub async fn constraints_stream(
+    axum::extract::Extension(preconf_relay): axum::extract::Extension<PreconfRelay>,
+) -> axum::response::Sse<impl futures::Stream<Item = eyre::Result<axum::response::sse::Event>>> {
+    let constraints_handle = preconf_relay.constraints_handle;
+    let constraints_rx = constraints_handle.constraints_tx.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(constraints_rx);
+
+    let filtered = stream.map(|result| match result {
+        Ok(constraint) => match serde_json::to_string(&vec![constraint]) {
+            Ok(json) => Ok(axum::response::sse::Event::default()
+                .data(json)
+                .event("signed_constraint")
+                .retry(Duration::from_millis(50))),
+            Err(err) => Err(eyre::eyre!("Error serializing constraint: {:?}", err)),
+        },
+        Err(err) => Err(eyre::eyre!("Error receiving constraint: {:?}", err)),
+    });
+
+    axum::response::Sse::new(filtered).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+#[derive(Clone, Debug)]
+pub struct ConstraintsHandle {
+    pub(crate) constraints_tx: broadcast::Sender<SignedConstraints>,
+}
+
+impl ConstraintsHandle {
+    pub fn send_constraints(&self, constraints: SignedConstraints) {
+        if self.constraints_tx.send(constraints).is_err() {
+            tracing::error!("Failed to send constraints to the constraints channel");
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use std::sync::{Arc, Mutex};
+
+    use crate::{
+        live_builder::constraint_client::ConstraintSubscriber,
+        primitives::mev_boost::{MevBoostRelay, RelayConfig},
+    };
+
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     #[ignore]
@@ -99,5 +186,71 @@ mod test {
                 return;
             }
         };
+    }
+
+    #[tokio::test]
+    async fn test_constraint_subscriber() {
+        let relay = PreconfRelay::new();
+
+        let constraints_handle = relay.constraints_handle;
+        let url = "http://localhost:8080";
+        let config = RelayConfig::default().with_url(url);
+
+        let relays = vec![MevBoostRelay::from_config(&config).unwrap()];
+        let constraint_subscriber = ConstraintSubscriber::new(relays, CancellationToken::new());
+
+        // Prepare multiple signed constraints
+        let test_constraints: Vec<SignedConstraints> =
+            serde_json::from_str(_get_signed_constraints_json()).unwrap();
+
+        // Send the signed constraints
+        for constraint in &test_constraints {
+            constraints_handle.send_constraints(constraint.clone());
+        }
+
+        let mut constraint_stream_channel = constraint_subscriber.spawn();
+        // Shared vector to collect received constraints
+        let received_constraints = Arc::new(Mutex::new(Vec::new()));
+        let received_constraints_clone = Arc::clone(&received_constraints);
+
+        tokio::spawn({
+            async move {
+                while let Some(constraint) = constraint_stream_channel.recv().await {
+                    received_constraints_clone.lock().unwrap().push(constraint);
+                }
+            }
+        });
+
+        // Wait for the constraints to be received
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let received_constraints = received_constraints.lock().unwrap();
+        assert_eq!(*received_constraints, test_constraints);
+    }
+
+    fn _get_signed_constraints_json() -> &'static str {
+        r#"[
+            {
+                "message": {
+                "pubkey": "0xa20322c78fb784ba5e0d9d67ccf71e96c7efa0ea49fda73d62e58f70aab2703b0edc3ea8547c655021858f98437ee790",
+                "slot": 987432,
+                "top": false,
+                "transactions": [ 
+                    "0x02f876018204db8405f5e100850218711a00825208949d22816f6611cfcb0cde5076c5f4e4a269e79bef8904563918244f40000080c080a0ee840d80915c9b506537909a5a6cf1ca2c5b47140d6585adab6ec0faf75fdcb7a07692785c5cb43c7cf02b800f"
+                ]
+                },
+                "signature": "0x1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505cc411d61252fb6cb3fa0017b679f8bb2305b26a285fa2737f175668d0dff91cc1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505"
+            }, {
+                "message": {
+                "pubkey": "0xa20322c78fb784ba5e0d9d67ccf71e96c7efa0ea49fda73d62e58f70aab2703b0edc3ea8547c655021858f98437ee790",
+                "slot": 987433,
+                "top": false,
+                "transactions": [
+                    "0x02f876018204dbd40c45bf2105dd18711a0082d208949da2816f6611bcab0cde5076c5f4e4a269e79bef8904563918244f40111180c080a0ee840d80915c9b506537909a5a6cf1ca2c5b47140d6585adab6ec0faf75fdcb7a07692785c5cb43c7cf02b800f"
+                ]
+                },
+                "signature": "0x1b68ac14b663c9fc5b50984123ec9534bbd9cceda73e670af888da41af171505cc411d61252fb6cb3fa0017b679f8bb2305b26a285fa2737f175668d0dff91cc1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505"
+            }
+            ]"#
     }
 }
