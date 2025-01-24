@@ -9,14 +9,13 @@ use crate::{
         simulated_order_command_to_sink, BlockBuildingContext, SimulatedOrderSink,
     },
     live_builder::{payload_events::MevBoostSlotData, simulation::SlotOrderSimResults},
-    primitives::constraints::SignedConstraints,
-    primitives::{OrderId, SimulatedOrder},
+    primitives::{constraints::SignedConstraints, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
 };
 use revm_primitives::Address;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use super::{
     order_input::{
@@ -111,11 +110,14 @@ where
         cancel: CancellationToken,
         slot_constraints: Option<Vec<SignedConstraints>>,
     ) {
-        let builder_sink = self.sink_factory.create_sink(slot_data, cancel.clone());
+        let builder_sink = self
+            .sink_factory
+            .create_sink(slot_data.clone(), cancel.clone());
         let (broadcast_input, _) = broadcast::channel(10_000);
 
         let block_number = ctx.block_env.number.to::<u64>();
 
+        let slot = slot_data.slot();
         for builder in self.builders.iter() {
             let builder_name = builder.name();
             debug!(block = block_number, builder_name, "Spawning builder job");
@@ -130,6 +132,7 @@ where
             let slot_constraints = slot_constraints.clone();
             tokio::task::spawn_blocking(move || {
                 if let Some(constraints) = &slot_constraints {
+                    info!("Preparing block with constraints for slot {}", slot);
                     builder.build_blocks_with_constraints(input, constraints.clone());
                 } else {
                     builder.build_blocks(input);

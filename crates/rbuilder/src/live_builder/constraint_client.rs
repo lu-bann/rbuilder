@@ -4,7 +4,7 @@ use reqwest_eventsource::{Event, EventSource};
 use tokio_util::sync::CancellationToken;
 
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 #[derive(Debug)]
 pub struct ConstraintSubscriber {
@@ -23,20 +23,20 @@ impl ConstraintSubscriber {
     pub fn spawn(self) -> mpsc::UnboundedReceiver<SignedConstraints> {
         let (send, receive) = mpsc::unbounded_channel();
 
+        info!("Starting constraint subscriber");
+
         let relay = self.relays.first().expect("at least one relay");
         let request = relay.client.build_constraint_stream_request();
         let event_source = EventSource::new(request).unwrap_or_else(|err| {
             panic!("Failed to create EventSource: {:?}", err);
         });
 
-        info!("Starting constraint subscriber");
-
         tokio::spawn(async move {
             let mut event_source = event_source;
             while let Some(event) = event_source.next().await {
                 match event {
                     Ok(Event::Message(message)) => {
-                        println!("Received SSE message: {:?}", message);
+                        info!("Received SSE message: {:?}", message);
                         if message.event == "signed_constraint" {
                             let data = &message.data;
                             let received_constraints =
@@ -54,10 +54,10 @@ impl ConstraintSubscriber {
                         }
                     }
                     Ok(Event::Open) => {
-                        println!("SSE connection opened");
+                        info!("SSE connection opened");
                     }
                     Err(err) => {
-                        println!("Error receiving SSE event: {:?}", err);
+                        error!("Error receiving SSE event: {:?}", err);
                     }
                 }
             }

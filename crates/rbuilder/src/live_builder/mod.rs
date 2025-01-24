@@ -19,8 +19,8 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
-    provider::StateProviderFactory,
     primitives::constraints::SignedConstraints,
+    provider::StateProviderFactory,
     telemetry::inc_active_slots,
     utils::{
         error_storage::spawn_error_storage_writer, provider_head_state::ProviderHeadState, Signer,
@@ -223,7 +223,8 @@ where
                         .write()
                         .entry(constraint.message.slot)
                         .or_default()
-                        .push(constraint);
+                        .push(constraint.clone());
+                    info!("Wrote constraint to constraint-store: {:?}", constraint);
                 }
             }
         });
