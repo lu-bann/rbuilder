@@ -36,7 +36,6 @@ impl ConstraintSubscriber {
             while let Some(event) = event_source.next().await {
                 match event {
                     Ok(Event::Message(message)) => {
-                        info!("Received SSE message: {:?}", message);
                         if message.event == "signed_constraint" {
                             let data = &message.data;
                             let received_constraints =
@@ -61,9 +60,11 @@ impl ConstraintSubscriber {
                     }
                 }
             }
+
+            info!("Stopping constraint subscriber");
+            self.global_cancellation.cancel();
         });
 
-        self.global_cancellation.cancel();
         receive
     }
 }
