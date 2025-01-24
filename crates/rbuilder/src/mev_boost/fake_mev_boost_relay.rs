@@ -9,6 +9,7 @@ use std::{
 use axum::routing::get;
 use futures::StreamExt;
 use tokio::sync::broadcast;
+use tracing::{error, info};
 
 use crate::primitives::constraints::SignedConstraints;
 
@@ -95,37 +96,44 @@ impl Drop for FakeMevBoostRelayInstance {
 #[derive(Clone, Debug)]
 pub struct PreconfRelay {
     constraints_handle: ConstraintsHandle,
-}
-
-impl PreconfRelay {
-    pub fn new() -> Self {
-        let constraints_tx = broadcast::channel(128).0;
-        let constraints_handle = ConstraintsHandle { constraints_tx };
-        Self { constraints_handle }
-    }
-}
-
-pub struct PreconfRelayServer {
-    /// The address to bind the server to
     addr: SocketAddr,
 }
 
-impl PreconfRelayServer {
+impl PreconfRelay {
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        let constraints_tx = broadcast::channel(128).0;
+        let constraints_handle = ConstraintsHandle { constraints_tx };
+        Self {
+            constraints_handle,
+            addr,
+        }
     }
 
     pub fn spawn(self) {
-        let relay = PreconfRelay::new();
         let router = axum::Router::new()
-            .route("/constraint_stream", get(constraints_stream))
-            .with_state(relay);
+            .route(
+                "/relay/v1/builder/constraints_stream",
+                get(constraints_stream),
+            )
+            .route("/health", get(health_check))
+            .with_state(self.clone());
 
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::bind(self.addr).await.unwrap();
             axum::serve(listener, router).await.unwrap();
         });
+
+        info!("Server running on {}", self.endpoint());
     }
+
+    pub fn endpoint(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+// Health check endpoint
+pub async fn health_check() -> impl axum::response::IntoResponse {
+    axum::Json(serde_json::json!({"status": "OK"}))
 }
 
 pub async fn constraints_stream(
@@ -156,15 +164,19 @@ pub struct ConstraintsHandle {
 
 impl ConstraintsHandle {
     pub fn send_constraints(&self, constraints: SignedConstraints) {
-        if self.constraints_tx.send(constraints).is_err() {
-            tracing::error!("Failed to send constraints to the constraints channel");
+        match self.constraints_tx.send(constraints) {
+            Ok(res) => info!("Sent constraint: {:?}", res),
+            Err(_) => error!("Failed to send constraint"),
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::{Arc, Mutex},
+    };
 
     use crate::{
         live_builder::constraint_client::ConstraintSubscriber,
@@ -188,25 +200,33 @@ mod test {
         };
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_constraint_subscriber() {
-        let relay = PreconfRelay::new();
+        tracing_subscriber::fmt::init();
 
-        let constraints_handle = relay.constraints_handle;
-        let url = "http://localhost:8080";
-        let config = RelayConfig::default().with_url(url);
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5656);
+        let relay = PreconfRelay::new(socket);
+        relay.clone().spawn();
 
+        let endpoint = relay.endpoint();
+        // let endpoint = "https://holesky-preconf.titanrelay.xyz/";
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // health check
+        let health_check = reqwest::get(&format!("{}/health", endpoint)).await.unwrap();
+        info!("Health check response: {:?}", health_check.status());
+
+        let config = RelayConfig::default().with_url(&endpoint);
         let relays = vec![MevBoostRelay::from_config(&config).unwrap()];
         let constraint_subscriber = ConstraintSubscriber::new(relays, CancellationToken::new());
 
+        let constraints_handle = relay.constraints_handle;
+
         // Prepare multiple signed constraints
         let test_constraints: Vec<SignedConstraints> =
-            serde_json::from_str(_get_signed_constraints_json()).unwrap();
-
-        // Send the signed constraints
-        for constraint in &test_constraints {
-            constraints_handle.send_constraints(constraint.clone());
-        }
+            serde_json::from_str(get_signed_constraints_json()).unwrap();
 
         let mut constraint_stream_channel = constraint_subscriber.spawn();
         // Shared vector to collect received constraints
@@ -221,6 +241,11 @@ mod test {
             }
         });
 
+        // Send the signed constraints
+        for constraint in &test_constraints {
+            constraints_handle.send_constraints(constraint.clone());
+        }
+
         // Wait for the constraints to be received
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -228,7 +253,7 @@ mod test {
         assert_eq!(*received_constraints, test_constraints);
     }
 
-    fn _get_signed_constraints_json() -> &'static str {
+    fn get_signed_constraints_json() -> &'static str {
         r#"[
             {
                 "message": {

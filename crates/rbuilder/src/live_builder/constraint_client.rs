@@ -29,6 +29,8 @@ impl ConstraintSubscriber {
             panic!("Failed to create EventSource: {:?}", err);
         });
 
+        info!("Starting constraint subscriber");
+
         tokio::spawn(async move {
             let mut event_source = event_source;
             while let Some(event) = event_source.next().await {

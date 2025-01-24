@@ -425,7 +425,7 @@ impl RelayClient {
     pub fn build_constraint_stream_request(&self) -> RequestBuilder {
         let url = {
             let mut url = self.url.clone();
-            url.set_path("/relay/v1/data/constraint_stream");
+            url.set_path("/relay/v1/builder/constraints_stream");
             url
         };
 

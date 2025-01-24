@@ -24,6 +24,7 @@ pub struct ConstraintsMessage {
 }
 
 impl ConstraintsMessage {
+    #[allow(dead_code)]
     fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(&self.pubkey.to_vec());
