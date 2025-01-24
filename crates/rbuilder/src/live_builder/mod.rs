@@ -256,7 +256,7 @@ where
             match timings.receive_constraints_cuttoff_duration {
                 Some(cuttoff_duration) => {
                     let time_until_constraints_cuttoff =
-                        time_to_slot + (cuttoff_duration - Duration::from_secs(SECONDS_PER_SLOT));
+                        time_to_slot + cuttoff_duration - Duration::from_secs(SECONDS_PER_SLOT);
                     if time_until_constraints_cuttoff.is_negative() {
                         debug!(
                             slot = payload.slot(),
