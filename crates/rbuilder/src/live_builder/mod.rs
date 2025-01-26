@@ -214,6 +214,7 @@ where
             }
         };
 
+        let token = self.global_cancellation.clone();
         // Subscribe to the constraint stream
         let mut constraint_stream_channel = self.constraint_subscriber.unwrap().spawn();
         tokio::spawn({
@@ -227,6 +228,9 @@ where
                         .push(constraint.clone());
                     info!("Wrote constraint to constraint-store: {:?}", constraint);
                 }
+
+                info!("Constraint stream channel closed");
+                token.cancel();
             }
         });
 
@@ -385,6 +389,13 @@ where
             if time_to_sleep.is_negative() {
                 break;
             }
+            warn!(
+                block = ?block,
+                slot_time = ?slot_time,
+                deadline = ?deadline,
+                "Block header not found, sleeping for {:?}",
+                time_to_sleep
+            );
             tokio::time::sleep(time_to_sleep.try_into().unwrap()).await;
         }
     }
