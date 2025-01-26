@@ -56,7 +56,7 @@ pub struct TimingsConfig {
     /// Polling period while trying to get a block header
     pub get_block_header_period: time::Duration,
     /// Time to wait for constraints to be received before building a block
-    pub receive_constraints_cuttoff_duration: Option<Duration>,
+    pub receive_constraints_cuttoff_duration: Option<time::Duration>,
 }
 
 impl TimingsConfig {
@@ -66,7 +66,7 @@ impl TimingsConfig {
             slot_proposal_duration: Duration::from_secs(4),
             block_header_deadline_delta: time::Duration::milliseconds(-2500),
             get_block_header_period: time::Duration::milliseconds(250),
-            receive_constraints_cuttoff_duration: Some(Duration::from_secs(8)),
+            receive_constraints_cuttoff_duration: Some(time::Duration::seconds(5)),
         }
     }
 
@@ -214,6 +214,7 @@ where
             }
         };
 
+        // Subscribe to the constraint stream
         let mut constraint_stream_channel = self.constraint_subscriber.unwrap().spawn();
         tokio::spawn({
             let constraint_store_clone = self.constraint_store.clone();
@@ -255,8 +256,10 @@ where
             // If we have a constraints cuttoff time, we should wait until it passes before
             match timings.receive_constraints_cuttoff_duration {
                 Some(cuttoff_duration) => {
-                    let time_until_constraints_cuttoff =
-                        time_to_slot + cuttoff_duration - Duration::from_secs(SECONDS_PER_SLOT);
+                    let time_until_constraints_cuttoff = (time_to_slot + cuttoff_duration)
+                        .saturating_sub(time::Duration::seconds(
+                            SECONDS_PER_SLOT.try_into().unwrap(),
+                        ));
                     if time_until_constraints_cuttoff.is_negative() {
                         debug!(
                             slot = payload.slot(),

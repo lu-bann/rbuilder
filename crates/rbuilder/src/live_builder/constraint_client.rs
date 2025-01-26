@@ -45,7 +45,6 @@ impl ConstraintSubscriber {
                                     .first()
                                     .cloned()
                                     .expect("at least one constraint");
-                            info!("Received constraint: {:?}", received_constraints);
                             if send.send(received_constraints).is_err() {
                                 debug!("Constraint channel closed");
                                 break;
