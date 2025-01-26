@@ -264,10 +264,10 @@ where
                         debug!(
                             slot = payload.slot(),
                             "Constraints cuttoff time hasn't passed, sleeping for {}",
-                            time_until_constraints_cuttoff.as_seconds_f64()
+                            time_until_constraints_cuttoff.as_seconds_f64().abs()
                         );
                         tokio::time::sleep(Duration::from_secs_f64(
-                            time_until_constraints_cuttoff.as_seconds_f64(),
+                            time_until_constraints_cuttoff.as_seconds_f64().abs(),
                         ))
                         .await;
                     };
