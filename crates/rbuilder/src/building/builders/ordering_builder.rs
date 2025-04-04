@@ -11,24 +11,34 @@ use crate::{
         builders::{
             block_building_helper::BlockBuildingHelper, LiveBuilderInput, OrderIntakeConsumer,
         },
-        BlockBuildingContext, ExecutionError, PrioritizedOrderStore, SimulatedOrderSink, Sorting,
+        BlockBuildingContext, ExecutionError, OrderPriority, PrioritizedOrderStore,
+        SimulatedOrderSink, Sorting,
     },
     primitives::{
-        constraints::SignedConstraints, AccountNonce, OrderId,
+        constraints::SignedConstraints, AccountNonce, OrderId, SimValue,
         TransactionSignedEcRecoveredWithBlobs,
     },
     provider::StateProviderFactory,
+    telemetry::mark_builder_considers_order,
+    utils::NonceCache,
 };
 use ahash::{HashMap, HashSet};
+use derivative::Derivative;
 use reth::revm::cached::CachedReads;
+use reth_provider::StateProvider;
 use serde::Deserialize;
-use std::time::{Duration, Instant};
+use std::{
+    marker::PhantomData,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info_span, trace, warn};
 
 use super::{
-    block_building_helper::BlockBuildingHelperFromProvider, handle_building_error,
-    BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm, BlockBuildingAlgorithmInput,
+    block_building_helper::{BiddableUnfinishedBlock, BlockBuildingHelperFromProvider},
+    handle_building_error, BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
+    BlockBuildingAlgorithmInput,
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -59,22 +69,39 @@ impl OrderingBuilderConfig {
     }
 }
 
-pub fn run_ordering_builder<P>(
+pub fn run_ordering_builder<P, OrderPriorityType>(
     input: LiveBuilderInput<P>,
     config: &OrderingBuilderConfig,
     slot_constraints: Option<Vec<SignedConstraints>>,
 ) where
     P: StateProviderFactory + Clone + 'static,
+    OrderPriorityType: OrderPriority,
 {
-    let mut order_intake_consumer = OrderIntakeConsumer::new(
-        input.provider.clone(),
-        input.input,
-        input.ctx.attributes.parent,
-        config.sorting,
-    );
+    let payload_id = input.ctx.payload_id;
+
+    let block_state: Arc<dyn StateProvider> = match input
+        .provider
+        .history_by_block_hash(input.ctx.attributes.parent)
+    {
+        Ok(state) => Arc::from(state),
+        Err(err) => {
+            error!(
+                ?err,
+                payload_id,
+                builder = input.builder_name,
+                "Failed to get history_by_block_hash, cancelling builder job"
+            );
+            return;
+        }
+    };
+
+    let nonces = NonceCache::new(block_state.clone());
+
+    let mut order_intake_consumer =
+        OrderIntakeConsumer::<OrderPriorityType>::new(nonces, input.input);
 
     let mut builder = OrderingBuilderContext::new(
-        input.provider.clone(),
+        block_state.clone(),
         input.builder_name,
         input.ctx,
         config.clone(),
@@ -88,7 +115,7 @@ pub fn run_ordering_builder<P>(
             break 'building;
         }
 
-        match order_intake_consumer.consume_next_batch() {
+        match order_intake_consumer.blocking_consume_next_batch() {
             Ok(ok) => {
                 if !ok {
                     break 'building;
@@ -133,10 +160,12 @@ pub fn run_ordering_builder<P>(
                     if block.built_block_trace().got_no_signer_error {
                         use_suggested_fee_recipient_as_coinbase = false;
                     }
-                    input.sink.new_block(block);
+                    if let Ok(block) = BiddableUnfinishedBlock::new(block) {
+                        input.sink.new_block(block);
+                    }
                 }
                 Err(err) => {
-                    if !handle_building_error(err) {
+                    if !handle_building_error(err, payload_id) {
                         break 'building;
                     }
                 }
@@ -150,7 +179,7 @@ pub fn run_ordering_builder<P>(
     }
 }
 
-pub fn backtest_simulate_block<P>(
+pub fn backtest_simulate_block<P, OrderPriorityType: OrderPriority>(
     ordering_config: OrderingBuilderConfig,
     input: BacktestSimulateBlockInput<'_, P>,
 ) -> eyre::Result<(Block, CachedReads)>
@@ -160,11 +189,11 @@ where
     let use_suggested_fee_recipient_as_coinbase = ordering_config.coinbase_payment;
     let state_provider = input
         .provider
-        .history_by_block_number(input.ctx.block_env.number.to::<u64>() - 1)?;
+        .history_by_block_number(input.ctx.evm_env.block_env.number - 1)?;
     let block_orders =
-        block_orders_from_sim_orders(input.sim_orders, ordering_config.sorting, &state_provider)?;
+        block_orders_from_sim_orders::<OrderPriorityType>(input.sim_orders, &state_provider)?;
     let mut builder = OrderingBuilderContext::new(
-        input.provider.clone(),
+        Arc::from(state_provider),
         input.builder_name,
         input.ctx.clone(),
         ordering_config,
@@ -181,16 +210,18 @@ where
     } else {
         Some(block_builder.true_block_value()?)
     };
-    let finalize_block_result = block_builder.finalize_block(payout_tx_value)?;
+    let finalize_block_result = block_builder.finalize_block(payout_tx_value, None)?;
     Ok((
         finalize_block_result.block,
         finalize_block_result.cached_reads,
     ))
 }
 
-#[derive(Debug)]
-pub struct OrderingBuilderContext<P> {
-    provider: P,
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct OrderingBuilderContext {
+    #[derivative(Debug = "ignore")]
+    state: Arc<dyn StateProvider>,
     builder_name: String,
     ctx: BlockBuildingContext,
     config: OrderingBuilderConfig,
@@ -203,18 +234,15 @@ pub struct OrderingBuilderContext<P> {
     order_attempts: HashMap<OrderId, usize>,
 }
 
-impl<P> OrderingBuilderContext<P>
-where
-    P: StateProviderFactory + Clone + 'static,
-{
+impl OrderingBuilderContext {
     pub fn new(
-        provider: P,
+        state: Arc<dyn StateProvider>,
         builder_name: String,
         ctx: BlockBuildingContext,
         config: OrderingBuilderConfig,
     ) -> Self {
         Self {
-            provider,
+            state,
             builder_name,
             ctx,
             config,
@@ -238,9 +266,9 @@ where
     /// use_suggested_fee_recipient_as_coinbase: all the mev profit goes directly to the slot suggested_fee_recipient so we avoid the payout tx.
     ///     This mode disables mev-share orders since the builder has to receive the mev profit to give some portion back to the mev-share user.
     /// !use_suggested_fee_recipient_as_coinbase: all the mev profit goes to the builder and at the end of the block we pay to the suggested_fee_recipient.
-    pub fn build_block(
+    pub fn build_block<OrderPriorityType: OrderPriority>(
         &mut self,
-        block_orders: PrioritizedOrderStore,
+        block_orders: PrioritizedOrderStore<OrderPriorityType>,
         use_suggested_fee_recipient_as_coinbase: bool,
         cancel_block: CancellationToken,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
@@ -259,14 +287,58 @@ where
         self.order_attempts.clear();
 
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
-            self.provider.clone(),
+            self.state.clone(),
             new_ctx,
             self.cached_reads.take(),
             self.builder_name.clone(),
             self.config.discard_txs,
-            self.config.sorting.into(),
             cancel_block,
         )?;
+
+        self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
+        block_building_helper.set_trace_fill_time(build_start.elapsed());
+        self.cached_reads = Some(block_building_helper.clone_cached_reads());
+        Ok(Box::new(block_building_helper))
+    }
+
+    pub fn build_blocks_with_constraints(
+        &mut self,
+        block_orders: PrioritizedOrderStore,
+        use_suggested_fee_recipient_as_coinbase: bool,
+        cancel_block: CancellationToken,
+        slot_constraints: Vec<SignedConstraints>,
+    ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
+        let build_attempt_id: u32 = rand::random();
+        let span = info_span!("build_run", build_attempt_id);
+        let _guard = span.enter();
+
+        let build_start = Instant::now();
+
+        // Create a new ctx to remove builder_signer if necessary
+        let mut new_ctx = self.ctx.clone();
+        if use_suggested_fee_recipient_as_coinbase {
+            new_ctx.modify_use_suggested_fee_recipient_as_coinbase();
+        }
+        self.failed_orders.clear();
+        self.order_attempts.clear();
+
+        let mut block_building_helper = BlockBuildingHelperFromProvider::new(
+            self.state.clone(),
+            new_ctx,
+            self.cached_reads.take(),
+            self.builder_name.clone(),
+            self.config.discard_txs,
+            cancel_block,
+        )?;
+
+        // fill constraints
+        let constraints = self.fill_constraints(
+            &mut block_building_helper,
+            slot_constraints,
+            block_orders.clone(),
+            build_start,
+        )?;
+        block_building_helper.set_constraints(constraints);
 
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
@@ -384,10 +456,74 @@ where
         Ok(result)
     }
 
-    fn fill_orders(
+    fn fill_constraints(
         &mut self,
         block_building_helper: &mut dyn BlockBuildingHelper,
-        mut block_orders: PrioritizedOrderStore,
+        slot_constraints: Vec<SignedConstraints>,
+        mut block_orders: PrioritizedOrderStore<OrderPriorityType>,
+        build_start: Instant,
+    ) -> eyre::Result<Vec<TransactionSignedEcRecoveredWithBlobs>> {
+        let mut result = Vec::new();
+        for constraint in slot_constraints {
+            let transactions = constraint.message.transactions.to_vec();
+            for tx in transactions {
+                if let Some(deadline) = self.config.build_duration_deadline() {
+                    if build_start.elapsed() > deadline {
+                        break;
+                    }
+                }
+
+                let start_time = Instant::now();
+                let tx_bytes = tx.to_vec();
+                let tx = TransactionSignedEcRecoveredWithBlobs::decode_enveloped_with_real_blobs(
+                    alloy_primitives::Bytes::from(tx_bytes),
+                )?;
+                let tx_hash = tx.internal_tx_unsecure().hash().to_string();
+                let commit_result = block_building_helper.commit_constraint(&tx)?;
+                let order_commit_time = start_time.elapsed();
+                let mut gas_used = 0;
+                let mut execution_error = None;
+                let success = commit_result.is_ok();
+                match commit_result {
+                    Ok(res) => {
+                        gas_used = res.gas_used;
+                        let nonces_updated: Vec<_> = res
+                            .nonces_updated
+                            .iter()
+                            .map(|(account, nonce)| AccountNonce {
+                                account: *account,
+                                nonce: *nonce,
+                            })
+                            .collect();
+                        block_orders.update_onchain_nonces(&nonces_updated);
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "Error committing constraint, block submission will fail"
+                        );
+                        execution_error = Some(err);
+                    }
+                }
+                trace!(
+                    order_id = tx_hash,
+                    success,
+                    order_commit_time_mus = order_commit_time.as_micros(),
+                    gas_used,
+                    ?execution_error,
+                    "Executed order"
+                );
+                result.push(tx);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn fill_orders<OrderPriorityType: OrderPriority>(
+        &mut self,
+        block_building_helper: &mut dyn BlockBuildingHelper,
+        mut block_orders: PrioritizedOrderStore<OrderPriorityType>,
         build_start: Instant,
     ) -> eyre::Result<()> {
         let mut order_attempts: HashMap<OrderId, usize> = HashMap::default();
@@ -398,8 +534,15 @@ where
                     break;
                 }
             }
+            mark_builder_considers_order(
+                sim_order.id(),
+                &block_building_helper.built_block_trace().orders_closed_at,
+                block_building_helper.builder_name(),
+            );
             let start_time = Instant::now();
-            let commit_result = block_building_helper.commit_order(&sim_order)?;
+            let commit_result = block_building_helper.commit_order(&sim_order, &|sim_result| {
+                simulation_too_low::<OrderPriorityType>(&sim_order.sim_value, sim_result)
+            })?;
             let order_commit_time = start_time.elapsed();
             let mut gas_used = 0;
             let mut execution_error = None;
@@ -424,9 +567,9 @@ where
                         // try to reinsert order into the map
                         let order_attempts = order_attempts.entry(sim_order.id()).or_insert(0);
                         if *order_attempts < self.config.failed_order_retries {
-                            let mut new_order = sim_order.clone();
+                            let mut new_order = (*sim_order).clone();
                             new_order.sim_value = inplace.clone();
-                            block_orders.insert_order(new_order);
+                            block_orders.insert_order(Arc::new(new_order));
                             *order_attempts += 1;
                             reinserted = true;
                         }
@@ -452,20 +595,28 @@ where
 }
 
 #[derive(Debug)]
-pub struct OrderingBuildingAlgorithm {
+pub struct OrderingBuildingAlgorithm<OrderPriorityType> {
     config: OrderingBuilderConfig,
     name: String,
+    /// The ordering priority type used to sort simulated orders.
+    order_priority: PhantomData<OrderPriorityType>,
 }
 
-impl OrderingBuildingAlgorithm {
+impl<OrderPriorityType> OrderingBuildingAlgorithm<OrderPriorityType> {
     pub fn new(config: OrderingBuilderConfig, name: String) -> Self {
-        Self { config, name }
+        Self {
+            config,
+            name,
+            order_priority: PhantomData,
+        }
     }
 }
 
-impl<P> BlockBuildingAlgorithm<P> for OrderingBuildingAlgorithm
+impl<P, OrderPriorityType> BlockBuildingAlgorithm<P>
+    for OrderingBuildingAlgorithm<OrderPriorityType>
 where
     P: StateProviderFactory + Clone + 'static,
+    OrderPriorityType: OrderPriority,
 {
     fn name(&self) -> String {
         self.name.clone()
@@ -480,7 +631,7 @@ where
             builder_name: self.name.clone(),
             cancel: input.cancel,
         };
-        run_ordering_builder(live_input, &self.config, None);
+        run_ordering_builder::<P, OrderPriorityType>(live_input, &self.config, None);
     }
 
     fn build_blocks_with_constraints(
@@ -497,5 +648,111 @@ where
             cancel: input.cancel,
         };
         run_ordering_builder(live_input, &self.config, Some(slot_constraints));
+    }
+}
+
+// Check that new simulation results during block building are not much lower (defined by OrderPriority) than the top-of-block simulation results
+// @Opt is large err OK here
+#[allow(clippy::result_large_err)]
+fn simulation_too_low<OrderPriorityType: OrderPriority>(
+    original_sim_result: &SimValue,
+    new_sim_result: &SimValue,
+) -> Result<(), ExecutionError> {
+    if OrderPriorityType::simulation_too_low(original_sim_result, new_sim_result) {
+        Err(ExecutionError::LowerInsertedValue {
+            before: original_sim_result.clone(),
+            inplace: new_sim_result.clone(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::building::order_priority::{OrderMaxProfitPriority, OrderMevGasPricePriority};
+    use alloy_primitives::U256;
+
+    #[test]
+    fn test_simulation_too_low_max_profit() {
+        let sim_result = &SimValue {
+            coinbase_profit: U256::from(100),
+            mev_gas_price: U256::from(0),
+            ..Default::default()
+        };
+        let inplace_sim_result = &SimValue {
+            coinbase_profit: U256::from(94),
+            mev_gas_price: U256::from(0),
+            ..Default::default()
+        };
+
+        // Lower than 95% of the original value
+        assert!(
+            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_err()
+        );
+
+        // Equal to original value
+        let inplace_sim_result = &SimValue {
+            coinbase_profit: U256::from(100),
+            mev_gas_price: U256::from(0),
+            ..Default::default()
+        };
+        assert!(
+            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_ok()
+        );
+
+        // Higher than original value
+        let inplace_sim_result = &SimValue {
+            coinbase_profit: U256::from(105),
+            mev_gas_price: U256::from(0),
+            ..Default::default()
+        };
+        assert!(
+            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_simulation_too_low_mev_gas_price() {
+        let sim_result = &SimValue {
+            coinbase_profit: U256::from(0),
+            mev_gas_price: U256::from(100),
+            gas_used: 100,
+            ..Default::default()
+        };
+
+        // Lower than 95% of the original value
+        let inplace_sim_result = &SimValue {
+            coinbase_profit: U256::from(0),
+            mev_gas_price: U256::from(94),
+            gas_used: 94,
+            ..Default::default()
+        };
+        assert!(
+            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_err()
+        );
+
+        // Equal to original value
+        let inplace_sim_result = &SimValue {
+            coinbase_profit: U256::from(0),
+            mev_gas_price: U256::from(100),
+            gas_used: 105,
+            ..Default::default()
+        };
+        assert!(
+            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_ok()
+        );
+
+        // Higher than original value
+        let inplace_sim_result = &SimValue {
+            coinbase_profit: U256::from(0),
+            mev_gas_price: U256::from(105),
+            gas_used: 105,
+            ..Default::default()
+        };
+        assert!(
+            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_ok()
+        );
     }
 }

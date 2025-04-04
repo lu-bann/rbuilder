@@ -11,7 +11,7 @@ use self::{
     orderpool::{OrderPool, OrderPoolSubscriptionId},
     replaceable_order_sink::ReplaceableOrderSink,
 };
-use crate::primitives::{serialize::CancelShareBundle, BundleReplacementKey, Order};
+use crate::primitives::{serialize::CancelShareBundle, BundleReplacementData, Order};
 use crate::provider::StateProviderFactory;
 use crate::telemetry::{set_current_block, set_ordepool_count};
 use alloy_consensus::Header;
@@ -74,6 +74,12 @@ impl Drop for AutoRemovingOrderPoolSubscriptionId {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum MempoolSource {
+    Ipc(PathBuf),
+    Ws(String),
+}
+
 /// All the info needed to start all the order related jobs (mempool, rcp, clean)
 #[derive(Debug, Clone)]
 pub struct OrderInputConfig {
@@ -81,8 +87,8 @@ pub struct OrderInputConfig {
     ignore_cancellable_orders: bool,
     /// if true -- txs with blobs are ignored
     ignore_blobs: bool,
-    /// Path to reth ipc
-    ipc_path: Option<PathBuf>,
+    /// Tx pool source
+    mempool_source: Option<MempoolSource>,
     /// Input RPC port
     server_port: u16,
     /// Input RPC ip
@@ -103,7 +109,7 @@ impl OrderInputConfig {
     pub fn new(
         ignore_cancellable_orders: bool,
         ignore_blobs: bool,
-        ipc_path: Option<PathBuf>,
+        mempool_source: Option<MempoolSource>,
         server_port: u16,
         server_ip: Ipv4Addr,
         serve_max_connections: u32,
@@ -113,7 +119,7 @@ impl OrderInputConfig {
         Self {
             ignore_cancellable_orders,
             ignore_blobs,
-            ipc_path,
+            mempool_source,
             server_port,
             server_ip,
             serve_max_connections,
@@ -123,16 +129,19 @@ impl OrderInputConfig {
     }
 
     pub fn from_config(config: &BaseConfig) -> eyre::Result<Self> {
-        let el_node_ipc_path = config
-            .el_node_ipc_path
-            .as_ref()
-            .map(|p| expand_path(p.as_path()))
-            .transpose()?;
+        let mempool = if let Some(provider) = &config.ipc_provider {
+            Some(MempoolSource::Ws(provider.mempool_server_url.clone()))
+        } else if let Some(path) = &config.el_node_ipc_path {
+            let expanded_path = expand_path(path.as_path())?;
+            Some(MempoolSource::Ipc(expanded_path))
+        } else {
+            None
+        };
 
         Ok(OrderInputConfig {
             ignore_cancellable_orders: config.ignore_cancellable_orders,
             ignore_blobs: config.ignore_blobs,
-            ipc_path: el_node_ipc_path,
+            mempool_source: mempool,
             server_port: config.jsonrpc_server_port,
             server_ip: config.jsonrpc_server_ip,
             serve_max_connections: 4096,
@@ -143,7 +152,7 @@ impl OrderInputConfig {
 
     pub fn default_e2e() -> Self {
         Self {
-            ipc_path: Some(PathBuf::from("/tmp/anvil.ipc")),
+            mempool_source: Some(MempoolSource::Ipc(PathBuf::from("/tmp/anvil.ipc"))),
             results_channel_timeout: Duration::new(5, 0),
             ignore_cancellable_orders: false,
             ignore_blobs: false,
@@ -162,7 +171,7 @@ pub enum ReplaceableOrderPoolCommand {
     Order(Order),
     /// Cancellation for sbundle
     CancelShareBundle(CancelShareBundle),
-    CancelBundle(BundleReplacementKey),
+    CancelBundle(BundleReplacementData),
 }
 
 impl ReplaceableOrderPoolCommand {
@@ -222,8 +231,8 @@ where
 
     let mut handles = vec![clean_job, rpc_server];
 
-    if config.ipc_path.is_some() {
-        info!("IPC path configured, starting txpool subscription");
+    if config.mempool_source.is_some() {
+        info!("Txpool source configured, starting txpool subscription");
         let txpool_fetcher = txpool_fetcher::subscribe_to_txpool_with_blobs(
             config.clone(),
             order_sender.clone(),
@@ -232,7 +241,7 @@ where
         .await?;
         handles.push(txpool_fetcher);
     } else {
-        info!("No IPC path configured, skipping txpool subscription");
+        info!("No Txpool source configured, skipping txpool subscription");
     }
 
     let handle = tokio::spawn(async move {
@@ -294,7 +303,7 @@ where
             handle
                 .await
                 .map_err(|err| {
-                    tracing::error!("Error while waiting for OrderPoolJobs to finish: {:?}", err)
+                    tracing::error!(?err, "Error while waiting for OrderPoolJobs to finish")
                 })
                 .unwrap_or_default();
         }
@@ -328,33 +337,49 @@ where
     let handle = tokio::spawn(async move {
         info!("Clean orderpool job: started");
 
-        while let Some(header) = header_receiver.recv().await {
-            let block_number = header.number;
-            set_current_block(block_number);
-            let state = match provider_factory.latest() {
-                Ok(state) => state,
-                Err(err) => {
-                    error!("Failed to get latest state: {}", err);
-                    // @Metric error count
-                    continue;
+        loop {
+            tokio::select! {
+                header = header_receiver.recv() => {
+                    if let Some(header) = header {
+                        let current_block = header.number;
+                        set_current_block(current_block);
+                        let state = match provider_factory.latest() {
+                            Ok(state) => state,
+                            Err(err) => {
+                                error!("Failed to get latest state: {}", err);
+                                // @Metric error count
+                                continue;
+                            }
+                        };
+
+                        let mut orderpool = orderpool.lock();
+                        let start = Instant::now();
+
+                        orderpool.head_updated(current_block, &state);
+
+                        let update_time = start.elapsed();
+                        let (tx_count, bundle_count) = orderpool.content_count();
+                        set_ordepool_count(tx_count, bundle_count);
+                        debug!(
+                            current_block,
+                            tx_count,
+                            bundle_count,
+                            update_time_ms = update_time.as_millis(),
+                            "Cleaned orderpool",
+                        );
+                    } else {
+                        info!("Clean orderpool job: channel ended");
+                        if !global_cancellation.is_cancelled(){
+                            error!("Clean orderpool job: channel ended with no cancellation");
+                        }
+                        break;
+                    }
+                },
+                _ = global_cancellation.cancelled() => {
+                    info!("Clean orderpool job: received cancellation signal");
+                    break;
                 }
-            };
-
-            let mut orderpool = orderpool.lock();
-            let start = Instant::now();
-
-            orderpool.head_updated(block_number, &state);
-
-            let update_time = start.elapsed();
-            let (tx_count, bundle_count) = orderpool.content_count();
-            set_ordepool_count(tx_count, bundle_count);
-            debug!(
-                block_number,
-                tx_count,
-                bundle_count,
-                update_time_ms = update_time.as_millis(),
-                "Cleaned orderpool",
-            );
+            }
         }
 
         global_cancellation.cancel();

@@ -8,13 +8,13 @@ use crate::{
         BlockState, ExecutionError, ExecutionResult, OrderErr, PartialBlock,
     },
     primitives::{
-        order_builder::OrderBuilder, BundleReplacementData, OrderId, Refund, RefundConfig,
-        SimulatedOrder, TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
+        order_builder::OrderBuilder, BundleRefund, BundleReplacementData, OrderId, Refund,
+        RefundConfig, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
     },
 };
 use alloy_primitives::{Address, TxHash};
 use reth::revm::cached::CachedReads;
-use revm::db::BundleState;
+use revm::database::states::BundleState;
 
 pub enum NonceValue {
     /// Fixed value
@@ -35,7 +35,7 @@ pub struct TestSetup {
 impl TestSetup {
     pub fn gen_test_setup(block_args: BlockArgs) -> eyre::Result<Self> {
         Ok(Self {
-            partial_block: PartialBlock::new(true, None),
+            partial_block: PartialBlock::new(true),
             order_builder: OrderBuilder::None,
             bundle_state: None,
             cached_reads: None,
@@ -87,6 +87,10 @@ impl TestSetup {
         self.order_builder.set_inner_bundle_refund(refund)
     }
 
+    pub fn set_bundle_refund(&mut self, refund: BundleRefund) {
+        self.order_builder.set_bundle_refund(refund)
+    }
+
     pub fn set_inner_bundle_refund_config(&mut self, refund_config: Vec<RefundConfig>) {
         self.order_builder
             .set_inner_bundle_refund_config(refund_config)
@@ -129,7 +133,7 @@ impl TestSetup {
             .to(to)
             .value(value);
         let tx = self.test_chain.sign_tx(args)?;
-        let tx_hash = tx.hash;
+        let tx_hash = *tx.hash();
         self.order_builder.add_tx(
             TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap(),
             revert_behavior,
@@ -139,7 +143,7 @@ impl TestSetup {
 
     fn add_tx(&mut self, args: TxArgs, revert_behavior: TxRevertBehavior) -> eyre::Result<TxHash> {
         let tx = self.test_chain.sign_tx(args)?;
-        let tx_hash = tx.hash;
+        let tx_hash = *tx.hash();
         self.order_builder.add_tx(
             TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap(),
             revert_behavior,
@@ -221,6 +225,7 @@ impl TestSetup {
             &sim_order,
             self.test_chain.block_building_context(),
             &mut block_state,
+            &|_| Ok(()),
         )?;
 
         let (cached_reads, bundle_state, _) = block_state.into_parts();
@@ -235,7 +240,7 @@ impl TestSetup {
         res.expect("Order commit failed")
     }
 
-    pub fn commit_order_err(&mut self, expected_error: &str) {
+    pub fn commit_order_err_check_text(&mut self, expected_error: &str) {
         let res = self.try_commit_order().expect("Failed to commit order");
         match res {
             Ok(_) => panic!("expected error, result: {:#?}", res),
@@ -251,24 +256,16 @@ impl TestSetup {
         }
     }
 
-    /// Name a little confusing: We expect a ExecutionError::OrderError(OrderError(expected_error))
-    pub fn commit_order_err_order_error(&mut self, expected_error: &OrderErr) {
+    /// Name a little confusing: We expect a ExecutionError::OrderError(e) and err_check(e) is ran on the error.
+    pub fn commit_order_err_check<F: FnOnce(OrderErr)>(&mut self, err_check: F) {
         let res = self.try_commit_order().expect("Failed to commit order");
         match res {
             Ok(_) => panic!("expected error,got ok result: {:#?}", res),
             Err(err) => {
                 if let ExecutionError::OrderError(order_error) = err {
-                    if *expected_error != order_error {
-                        panic!(
-                            "unexpected OrderErr error: {}, expected: {}",
-                            order_error, expected_error
-                        );
-                    }
+                    err_check(order_error);
                 } else {
-                    panic!(
-                        "unexpected non OrderErr error: {}, expected: {}",
-                        err, expected_error
-                    );
+                    panic!("unexpected non OrderErr error: {}", err);
                 }
             }
         }
@@ -281,6 +278,16 @@ impl TestSetup {
             .with_cached_reads(self.cached_reads.clone().unwrap_or_default());
 
         Ok(block_state.nonce(self.test_chain.named_address(named_addr)?)?)
+    }
+
+    pub fn balance(&self, named_addr: NamedAddr) -> eyre::Result<i128> {
+        let state_provider = self.test_chain.provider_factory().latest()?;
+        let mut block_state = BlockState::new(state_provider)
+            .with_bundle_state(self.bundle_state.clone().unwrap_or_default())
+            .with_cached_reads(self.cached_reads.clone().unwrap_or_default());
+        Ok(block_state
+            .balance(self.test_chain.named_address(named_addr)?)?
+            .to())
     }
 
     pub fn nonce(&self, named_addr: NamedAddr, nonce_value: NonceValue) -> eyre::Result<u64> {

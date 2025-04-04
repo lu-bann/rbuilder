@@ -1,10 +1,12 @@
-use crate::roothash::RootHashConfig;
+use crate::roothash::RootHashContext;
 use crate::utils::RootHasherImpl;
 use alloy_consensus::Header;
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{BlockHash, BlockNumber, B256};
 use reth_errors::ProviderResult;
-use reth_provider::StateProviderBox;
 use reth_provider::{BlockReader, DatabaseProviderFactory, HeaderProvider};
+use reth_provider::{StateCommitmentProvider, StateProviderBox};
+use tracing::error;
 
 use super::{RootHasher, StateProviderFactory};
 
@@ -12,12 +14,15 @@ use super::{RootHasher, StateProviderFactory};
 #[derive(Clone)]
 pub struct StateProviderFactoryFromRethProvider<P> {
     provider: P,
-    config: RootHashConfig,
+    root_hash_context: RootHashContext,
 }
 
 impl<P> StateProviderFactoryFromRethProvider<P> {
-    pub fn new(provider: P, config: RootHashConfig) -> Self {
-        Self { provider, config }
+    pub fn new(provider: P, root_hash_context: RootHashContext) -> Self {
+        Self {
+            provider,
+            root_hash_context,
+        }
     }
 }
 
@@ -25,7 +30,8 @@ impl<P> StateProviderFactory for StateProviderFactoryFromRethProvider<P>
 where
     P: DatabaseProviderFactory<Provider: BlockReader>
         + reth_provider::StateProviderFactory
-        + HeaderProvider
+        + HeaderProvider<Header = Header>
+        + StateCommitmentProvider
         + Clone
         + 'static,
 {
@@ -61,11 +67,21 @@ where
         self.provider.last_block_number()
     }
 
-    fn root_hasher(&self, parent_hash: B256) -> Box<dyn RootHasher> {
-        Box::new(RootHasherImpl::new(
-            parent_hash,
-            self.config.clone(),
+    fn root_hasher(&self, parent_num_hash: BlockNumHash) -> ProviderResult<Box<dyn RootHasher>> {
+        let hasher = self.history_by_block_hash(parent_num_hash.hash)?;
+        let parent_state_root = self
+            .provider
+            .header_by_hash_or_number(parent_num_hash.hash.into())?
+            .map(|h| h.state_root);
+        if parent_state_root.is_none() {
+            error!("Parent hash is not found (for root_hasher)");
+        }
+        Ok(Box::new(RootHasherImpl::new(
+            parent_num_hash,
+            parent_state_root,
+            self.root_hash_context.clone(),
             self.provider.clone(),
-        ))
+            hasher,
+        )))
     }
 }

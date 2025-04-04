@@ -1,28 +1,28 @@
-use crate::building::builders::mock_block_building_helper::MockRootHasher;
-use crate::live_builder::simulation::SimulatedOrderCommand;
-use crate::provider::{RootHasher, StateProviderFactory};
-use crate::roothash::{calculate_state_root, run_trie_prefetcher, RootHashConfig, RootHashError};
-use crate::telemetry::{inc_provider_bad_reopen_counter, inc_provider_reopen_counter};
+use crate::{
+    building::builders::mock_block_building_helper::MockRootHasher,
+    live_builder::simulation::SimulatedOrderCommand,
+    provider::{RootHasher, StateProviderFactory},
+    roothash::{calculate_state_root, run_trie_prefetcher, RootHashContext, RootHashError},
+    telemetry::{inc_provider_bad_reopen_counter, inc_provider_reopen_counter},
+};
 use alloy_consensus::Header;
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_eips::BlockNumHash;
+use alloy_primitives::{BlockHash, BlockNumber, B256};
 use eth_sparse_mpt::reth_sparse_trie::SparseTrieSharedCache;
-use parking_lot::{Mutex, RwLock};
-use reth::providers::ExecutionOutcome;
-use reth::providers::{BlockHashReader, ChainSpecProvider, ProviderFactory};
+use parking_lot::Mutex;
+use reth::providers::{BlockHashReader, ChainSpecProvider, ExecutionOutcome, ProviderFactory};
 use reth_db::DatabaseError;
 use reth_errors::{ProviderError, ProviderResult, RethResult};
-use reth_node_api::NodeTypesWithDB;
+use reth_node_api::{NodePrimitives, NodeTypesWithDB};
 use reth_provider::{
     providers::{ProviderNodeTypes, StaticFileProvider},
-    BlockNumReader, HeaderProvider, StateProviderBox, StaticFileProviderFactory,
+    BlockNumReader, BlockReader, DatabaseProviderFactory, HashedPostStateProvider, HeaderProvider,
+    StateCommitmentProvider, StateProviderBox, StaticFileProviderFactory,
 };
-use reth_provider::{BlockReader, DatabaseProviderFactory};
-use revm_primitives::B256;
-use std::ops::DerefMut;
-use std::{path::PathBuf, sync::Arc};
+use std::{ops::DerefMut, path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, error};
 
 /// This struct is used as a workaround for https://github.com/paradigmxyz/reth/issues/7836
 /// it shares one instance of the provider factory that is recreated when inconsistency is detected.
@@ -33,12 +33,10 @@ pub struct ProviderFactoryReopener<N: NodeTypesWithDB> {
     provider_factory: Arc<Mutex<ProviderFactory<N>>>,
     chain_spec: Arc<N::ChainSpec>,
     static_files_path: PathBuf,
-    /// Last block the Reopener verified consistency for.
-    last_consistent_block: Arc<RwLock<Option<BlockNumber>>>,
     /// Patch to disable checking on test mode. Is ugly but ProviderFactoryReopener should die shortly (5/24/2024).
     testing_mode: bool,
     /// None ->No root hash (MockRootHasher)
-    root_hash_config: Option<RootHashConfig>,
+    root_hash_config: Option<RootHashContext>,
 }
 
 /// root_hash_config None -> MockRootHasher used
@@ -47,7 +45,7 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> ProviderFactoryReopener<N> 
         db: N::DB,
         chain_spec: Arc<N::ChainSpec>,
         static_files_path: PathBuf,
-        root_hash_config: Option<RootHashConfig>,
+        root_hash_config: Option<RootHashContext>,
     ) -> RethResult<Self> {
         let provider_factory = ProviderFactory::new(
             db,
@@ -61,13 +59,12 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> ProviderFactoryReopener<N> 
             static_files_path,
             root_hash_config,
             testing_mode: false,
-            last_consistent_block: Arc::new(RwLock::new(None)),
         })
     }
 
     pub fn new_from_existing(
         provider_factory: ProviderFactory<N>,
-        root_hash_config: Option<RootHashConfig>,
+        root_hash_config: Option<RootHashContext>,
     ) -> RethResult<Self> {
         let chain_spec = provider_factory.chain_spec();
         let static_files_path = provider_factory.static_file_provider().path().to_path_buf();
@@ -77,7 +74,6 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> ProviderFactoryReopener<N> 
             static_files_path,
             root_hash_config,
             testing_mode: true,
-            last_consistent_block: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -100,9 +96,7 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> ProviderFactoryReopener<N> 
             .map_err(|err| eyre::eyre!("Error getting best block number: {:?}", err))?;
         let mut provider_factory = self.provider_factory.lock();
 
-        // Don't need to check consistency for the block that was just checked.
-        let last_consistent_block = *self.last_consistent_block.read();
-        if !self.testing_mode && last_consistent_block != Some(best_block_number) {
+        if !self.testing_mode {
             match check_block_hash_reader_health(best_block_number, provider_factory.deref_mut()) {
                 Ok(()) => {}
                 Err(err) => {
@@ -129,8 +123,6 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> ProviderFactoryReopener<N> 
                     );
                 }
             }
-
-            *self.last_consistent_block.write() = Some(best_block_number);
         }
         Ok(provider_factory.clone())
     }
@@ -179,6 +171,8 @@ pub fn check_block_hash_reader_health<R: BlockHashReader>(
 
 impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> StateProviderFactory
     for ProviderFactoryReopener<N>
+where
+    N::Primitives: NodePrimitives<BlockHeader = Header>,
 {
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         let provider = self
@@ -236,44 +230,71 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> StateProviderFactory
         provider.last_block_number()
     }
 
-    fn root_hasher(&self, parent_hash: B256) -> Box<dyn RootHasher> {
-        if let Some(root_hash_config) = &self.root_hash_config {
+    fn root_hasher(&self, parent_num_hash: BlockNumHash) -> ProviderResult<Box<dyn RootHasher>> {
+        Ok(if let Some(root_hash_config) = &self.root_hash_config {
             let provider = self
                 .check_consistency_and_reopen_if_needed()
                 .map_err(|e| ProviderError::Database(DatabaseError::Other(e.to_string())))
                 .unwrap();
+            let parent_state_root = provider
+                .header_by_hash_or_number(parent_num_hash.hash.into())?
+                .map(|h| h.state_root);
+            if parent_state_root.is_none() {
+                error!("Parent hash is not found (for root_hasher)");
+            }
             Box::new(RootHasherImpl::new(
-                parent_hash,
+                parent_num_hash,
+                parent_state_root,
                 root_hash_config.clone(),
+                provider.clone(),
                 provider,
             ))
         } else {
             Box::new(MockRootHasher {})
-        }
+        })
     }
 }
 
-pub struct RootHasherImpl<T> {
-    parent_hash: B256,
+pub struct RootHasherImpl<T, HasherType> {
+    parent_num_hash: BlockNumHash,
     provider: T,
+    hasher: HasherType,
     sparse_trie_shared_cache: SparseTrieSharedCache,
-    config: RootHashConfig,
+    config: RootHashContext,
 }
 
-impl<T> RootHasherImpl<T> {
-    pub fn new(parent_hash: B256, config: RootHashConfig, provider: T) -> Self {
+impl<T, HasherType> RootHasherImpl<T, HasherType> {
+    pub fn new(
+        parent_num_hash: BlockNumHash,
+        parent_state_root: Option<B256>,
+        config: RootHashContext,
+        provider: T,
+        hasher: HasherType,
+    ) -> Self {
+        let sparse_trie_shared_cache = if let Some(parent_state_root) = parent_state_root {
+            SparseTrieSharedCache::new_with_parent_hash(parent_state_root)
+        } else {
+            SparseTrieSharedCache::default()
+        };
         Self {
-            parent_hash,
+            parent_num_hash,
             provider,
+            hasher,
             config,
-            sparse_trie_shared_cache: Default::default(),
+            sparse_trie_shared_cache,
         }
     }
 }
 
-impl<T> RootHasher for RootHasherImpl<T>
+impl<T, HasherType> RootHasher for RootHasherImpl<T, HasherType>
 where
-    T: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync + Clone + 'static,
+    HasherType: HashedPostStateProvider,
+    T: DatabaseProviderFactory<Provider: BlockReader>
+        + StateCommitmentProvider
+        + Send
+        + Sync
+        + Clone
+        + 'static,
 {
     fn run_prefetcher(
         &self,
@@ -281,7 +302,7 @@ where
         cancel: CancellationToken,
     ) {
         run_trie_prefetcher(
-            self.parent_hash,
+            self.parent_num_hash,
             self.sparse_trie_shared_cache.clone(),
             self.provider.clone(),
             simulated_orders,
@@ -292,7 +313,8 @@ where
     fn state_root(&self, outcome: &ExecutionOutcome) -> Result<B256, RootHashError> {
         calculate_state_root(
             self.provider.clone(),
-            self.parent_hash,
+            &self.hasher,
+            self.parent_num_hash,
             outcome,
             self.sparse_trie_shared_cache.clone(),
             &self.config,
@@ -300,10 +322,10 @@ where
     }
 }
 
-impl<T> std::fmt::Debug for RootHasherImpl<T> {
+impl<T, HasherType> std::fmt::Debug for RootHasherImpl<T, HasherType> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RootHasherImpl")
-            .field("parent_hash", &self.parent_hash)
+            .field("parent_num_hash", &self.parent_num_hash)
             .finish()
     }
 }

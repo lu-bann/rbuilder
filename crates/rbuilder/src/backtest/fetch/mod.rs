@@ -1,3 +1,4 @@
+pub mod backtest_fetch;
 pub mod data_source;
 pub mod flashbots_db;
 pub mod mempool;
@@ -5,18 +6,18 @@ pub mod mev_boost;
 
 use crate::{
     backtest::{
-        fetch::data_source::{BlockRef, DataSource},
-        BlockData,
+        fetch::{
+            data_source::{BlockRef, DataSource},
+            mev_boost::PayloadDeliveredFetcher,
+        },
+        BlockData, OrdersWithTimestamp,
     },
     mev_boost::BuilderBlockReceived,
     utils::timestamp_as_u64,
 };
-
-use alloy_provider::Provider;
-use alloy_rpc_types::{Block, BlockId, BlockNumberOrTag, BlockTransactionsKind};
-
-use eyre::WrapErr;
-use flashbots_db::RelayDB;
+use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_types::{Block, BlockId, BlockNumberOrTag};
+use eyre::Context;
 use futures::TryStreamExt;
 use std::{
     collections::HashMap,
@@ -25,11 +26,6 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tracing::{info, trace};
-
-use crate::{
-    backtest::{fetch::mev_boost::PayloadDeliveredFetcher, OrdersWithTimestamp},
-    utils::BoxedProvider,
-};
 
 /// Struct that brings block information ([BlockData]) from several [DataSource]s
 /// Filters txs already landed (onchain nonce > tx nonce)
@@ -42,14 +38,14 @@ use crate::{
 /// 2 - call [HistoricalDataFetcher::fetch_historical_data] for all the needed blocks
 #[derive(Debug, Clone)]
 pub struct HistoricalDataFetcher {
-    eth_provider: BoxedProvider,
+    eth_provider: RootProvider,
     eth_rpc_parallel: usize,
     data_sources: Vec<Box<dyn DataSource>>,
     payload_delivered_fetcher: PayloadDeliveredFetcher,
 }
 
 impl HistoricalDataFetcher {
-    pub fn new(eth_provider: BoxedProvider, eth_rpc_parallel: usize) -> Self {
+    pub fn new(eth_provider: RootProvider, eth_rpc_parallel: usize) -> Self {
         Self {
             eth_provider,
             eth_rpc_parallel,
@@ -58,26 +54,15 @@ impl HistoricalDataFetcher {
         }
     }
 
-    pub fn with_default_datasource(
-        mut self,
-        mempool_datadir: PathBuf,
-        flashbots_db: Option<RelayDB>,
-    ) -> eyre::Result<Self> {
+    pub fn with_default_datasource(mut self, mempool_datadir: PathBuf) -> eyre::Result<Self> {
         let mempool = Box::new(mempool::MempoolDumpsterDatasource::new(mempool_datadir)?);
         self.data_sources.push(mempool);
-        if let Some(flashbots_db) = flashbots_db {
-            self.data_sources.push(Box::new(flashbots_db));
-        };
         Ok(self)
     }
 
-    pub fn with_datasource(self, datasource: Box<dyn DataSource>) -> Self {
-        let mut data_sources = self.data_sources;
-        data_sources.push(datasource);
-        Self {
-            data_sources,
-            ..self
-        }
+    pub fn with_datasource(mut self, datasource: Box<dyn DataSource>) -> Self {
+        self.data_sources.push(datasource);
+        self
     }
 
     async fn get_payload_delivered_bid_trace(
@@ -102,10 +87,8 @@ impl HistoricalDataFetcher {
     async fn get_onchain_block(&self, block_number: u64) -> eyre::Result<Block> {
         let block = self
             .eth_provider
-            .get_block_by_number(
-                BlockNumberOrTag::Number(block_number),
-                BlockTransactionsKind::Full,
-            )
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .full()
             .await
             .wrap_err_with(|| format!("Failed to fetch block {}", block_number))?
             .ok_or_else(|| eyre::eyre!("Block {} not found", block_number))?;
@@ -129,7 +112,7 @@ impl HistoricalDataFetcher {
 
     /// Filters out orders with non-optional sub txs (we can't skip them) already landed (onchain nonce > tx nonce, can't be re-executed!)
     /// since they will fail.
-    /// Also filters orders the will not fail but will execute nothing (eg: all optional already landed txs -> all txs will be skipped).
+    /// Also filters orders that will not fail but will execute nothing (eg: all optional already landed txs -> all txs will be skipped).
     async fn filter_order_by_nonces(
         &self,
         orders: Vec<OrdersWithTimestamp>,
@@ -210,7 +193,7 @@ impl HistoricalDataFetcher {
     }
 
     pub async fn fetch_historical_data(&self, block_number: u64) -> eyre::Result<BlockData> {
-        info!("Fetching historical data for block {}", block_number);
+        info!(block_number, "Fetching historical data for block");
 
         info!("Fetching payload delivered");
         let winning_bid_trace = self.get_payload_delivered_bid_trace(block_number).await?;
@@ -236,16 +219,16 @@ impl HistoricalDataFetcher {
             }
         }
 
-        info!("Fetched orders, unfiltered: {}", orders.len());
+        info!(count = orders.len(), "Fetched orders, unfiltered");
 
         let base_fee_per_gas = onchain_block.header.base_fee_per_gas.unwrap_or_default();
         self.filter_orders_by_base_fee(base_fee_per_gas as u128, &mut orders);
-        info!("Filtered orders by base fee, left: {}", orders.len());
+        info!(orders_left = orders.len(), "Filtered orders by base fee");
 
         let mut available_orders = self.filter_order_by_nonces(orders, block_number).await?;
         info!(
-            "Filtered orders by nonces, left: {}",
-            available_orders.len()
+            orders_left = available_orders.len(),
+            "Filtered orders by nonces"
         );
         available_orders.sort_by_key(|o| o.timestamp_ms);
 
@@ -255,6 +238,7 @@ impl HistoricalDataFetcher {
             onchain_block,
             available_orders,
             built_block_data,
+            filtered_orders: Default::default(),
         })
     }
 }

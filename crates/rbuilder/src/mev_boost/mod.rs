@@ -2,16 +2,15 @@ mod error;
 pub mod fake_mev_boost_relay;
 pub mod rpc;
 pub mod sign_payload;
+pub mod submission;
 
 use crate::primitives::proofs::InclusionProofs;
 
 use super::utils::u256decimal_serde_helper;
 
 use alloy_primitives::{Address, BlockHash, Bytes, U256};
-use alloy_rpc_types_beacon::relay::{
-    BidTrace, SignedBidSubmissionV2, SignedBidSubmissionV3, SignedBidSubmissionV4,
-};
 use flate2::{write::GzEncoder, Compression};
+use itertools::Itertools;
 use primitive_types::H384;
 use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
@@ -21,10 +20,15 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use ssz::Encode;
 use std::{io::Write, str::FromStr};
+use submission::{SubmitBlockRequest, SubmitBlockRequestNoBlobs, SubmitBlockRequestWithMetadata};
 use url::Url;
 
 pub use error::*;
 pub use sign_payload::*;
+
+const TOTAL_PAYMENT_HEADER: &str = "Total-Payment";
+const BUNDLE_HASHES_HEADER: &str = "Bundle-Hashes";
+const TOP_BID_HEADER: &str = "Top-Bid";
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
@@ -38,9 +42,11 @@ const API_TOKEN_HEADER: &str = "X-Api-Token";
 const SIM_FAILED_SUBSTRING: &str = "simulation failed";
 /// Any error containing SIM_FAILED_SUBSTRING and any of SIM_FAILED_NON_CRITICAL_ERRORS is not critical so we should not stop block building.
 const SIM_FAILED_NON_CRITICAL_ERRORS: &[&str] = &[
-    "blacklisted address", // Generated block is good but contains a blacklisted address. This happens if we don't use an OFAC blacklist but the relay does.
+    "blacklisted address", // Generated block is good but contains a blacklisted address. This happens if we don't use an blacklist but the relay does.
     "unknown ancestor",
     "missing trie node",
+    "parent block not found", // Generated from time to time from agnostic relay "simulation failed: parent block not found"
+    "block is too old, outside validation window", // Generated from time to time from agnostic relay in the end of the slot
 ];
 
 // @Org consolidate with primitives::mev_boost
@@ -462,13 +468,17 @@ impl RelayClient {
     /// Mainly takes care of ssz/json raw/gzip
     async fn call_relay_submit_block(
         &self,
-        data: &SubmitBlockRequest,
+        submission_with_metadata: &SubmitBlockRequestWithMetadata,
         ssz: bool,
         gzip: bool,
+        fake_relay: bool,
+        cancellations: bool,
     ) -> Result<Response, SubmitBlockErr> {
         let mut url = {
             let mut url = self.url.clone();
             url.set_path("/relay/v1/builder/blocks");
+            url.query_pairs_mut()
+                .append_pair("cancellations", if cancellations { "1" } else { "0" });
             url
         };
 
@@ -477,7 +487,7 @@ impl RelayClient {
         // SSZ vs JSON
         let (mut body_data, content_type) = if ssz {
             (
-                match data {
+                match &submission_with_metadata.submission {
                     SubmitBlockRequest::Capella(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::Deneb(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
@@ -489,9 +499,17 @@ impl RelayClient {
                 SSZ_CONTENT_TYPE,
             )
         } else {
+            let json_result = if fake_relay {
+                // For the fake relay we remove the blobs
+                serde_json::to_vec(&SubmitBlockRequestNoBlobs(
+                    &submission_with_metadata.submission,
+                ))
+            } else {
+                serde_json::to_vec(&submission_with_metadata.submission)
+            };
+
             (
-                serde_json::to_vec(&data)
-                    .map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?,
+                json_result.map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?,
                 JSON_CONTENT_TYPE,
             )
         };
@@ -515,6 +533,45 @@ impl RelayClient {
         }
 
         builder = builder.headers(headers).body(Body::from(body_data));
+        if fake_relay {
+            builder = builder.header(
+                TOTAL_PAYMENT_HEADER,
+                submission_with_metadata
+                    .metadata
+                    .value
+                    .coinbase_reward
+                    .to_string(),
+            );
+            if let Some(top_competitor_bid) =
+                submission_with_metadata.metadata.value.top_competitor_bid
+            {
+                builder = builder.header(TOP_BID_HEADER, top_competitor_bid.to_string());
+            }
+            if !submission_with_metadata.metadata.order_ids.is_empty() {
+                const MAX_BUNDLE_IDS: usize = 150;
+                let bundle_ids: Vec<_> = submission_with_metadata
+                    .metadata
+                    .order_ids
+                    .iter()
+                    .filter_map(|or| match or {
+                        crate::primitives::OrderId::Tx(_fixed_bytes) => None,
+                        crate::primitives::OrderId::Bundle(uuid) => Some(uuid),
+                        crate::primitives::OrderId::ShareBundle(_fixed_bytes) => None,
+                    })
+                    .collect();
+                let total_bundles = bundle_ids.len();
+                let mut bundle_ids = bundle_ids
+                    .iter()
+                    .take(MAX_BUNDLE_IDS)
+                    .map(|uuid| format!("{:?}", uuid));
+                let bundle_ids = if total_bundles > MAX_BUNDLE_IDS {
+                    bundle_ids.join(",") + ",CAPPED"
+                } else {
+                    bundle_ids.join(",")
+                };
+                builder = builder.header(BUNDLE_HASHES_HEADER, bundle_ids);
+            }
+        }
 
         Ok(builder
             .send()
@@ -525,11 +582,15 @@ impl RelayClient {
     /// Submits the block (call_relay_submit_block) and processes some special errors.
     pub async fn submit_block(
         &self,
-        data: &SubmitBlockRequest,
+        data: &SubmitBlockRequestWithMetadata,
         ssz: bool,
         gzip: bool,
+        fake_relay: bool,
+        cancellations: bool,
     ) -> Result<(), SubmitBlockErr> {
-        let resp = self.call_relay_submit_block(data, ssz, gzip).await?;
+        let resp = self
+            .call_relay_submit_block(data, ssz, gzip, fake_relay, cancellations)
+            .await?;
         let status = resp.status();
 
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -615,54 +676,10 @@ impl RelayClient {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ElectraSubmitBlockRequest(SignedBidSubmissionV4);
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DenebSubmitBlockRequest(SignedBidSubmissionV3);
-
-impl DenebSubmitBlockRequest {
-    pub fn as_ssz_bytes(&self) -> Vec<u8> {
-        self.0.as_ssz_bytes()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CapellaSubmitBlockRequest(SignedBidSubmissionV2);
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DenebSubmitBlockWithProofsRequest(SignedBidSubmissionV3WithProofs);
-
-/// Submission for the `/relay/v1/builder/blocks_with_proofs` endpoint (Deneb).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SignedBidSubmissionV3WithProofs {
-    pub inner: SignedBidSubmissionV3,
-    /// Merkle proofs
-    pub proofs: InclusionProofs,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum SubmitBlockRequest {
-    Capella(CapellaSubmitBlockRequest),
-    Deneb(DenebSubmitBlockRequest),
-    DenebWithProofs(DenebSubmitBlockWithProofsRequest),
-    Electra(ElectraSubmitBlockRequest),
-}
-
-impl SubmitBlockRequest {
-    pub fn bid_trace(&self) -> BidTrace {
-        match self {
-            SubmitBlockRequest::Capella(req) => req.0.message.clone(),
-            SubmitBlockRequest::Deneb(req) => req.0.message.clone(),
-            SubmitBlockRequest::DenebWithProofs(req) => req.0.inner.message.clone(),
-            SubmitBlockRequest::Electra(req) => req.0.message.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use submission::{BidMetadata, BidValueMetadata};
+
     use super::{rpc::TestDataGenerator, *};
     use crate::mev_boost::fake_mev_boost_relay::FakeMevBoostRelay;
 
@@ -810,9 +827,19 @@ mod tests {
 
         let relay_url = Url::from_str(&srv.endpoint()).unwrap();
         let relay = RelayClient::from_url(relay_url, None, None, None);
-        let sub_relay = SubmitBlockRequest::Deneb(generator.create_deneb_submit_block_request());
+        let submission = SubmitBlockRequest::Deneb(generator.create_deneb_submit_block_request());
+        let sub_relay = SubmitBlockRequestWithMetadata {
+            submission,
+            metadata: BidMetadata {
+                value: BidValueMetadata {
+                    coinbase_reward: Default::default(),
+                    top_competitor_bid: None,
+                },
+                order_ids: vec![],
+            },
+        };
         relay
-            .submit_block(&sub_relay, true, true)
+            .submit_block(&sub_relay, true, true, false, false)
             .await
             .expect("OPS!");
     }

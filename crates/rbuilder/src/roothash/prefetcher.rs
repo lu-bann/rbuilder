@@ -1,7 +1,8 @@
 use std::{iter, time::Instant};
 
 use ahash::{HashMap, HashSet};
-use alloy_primitives::{Address, B256};
+use alloy_eips::BlockNumHash;
+use alloy_primitives::Address;
 use eth_sparse_mpt::{
     prefetch_tries_for_accounts,
     reth_sparse_trie::{trie_fetcher::FetchNodeError, SparseTrieError, SparseTrieSharedCache},
@@ -9,7 +10,7 @@ use eth_sparse_mpt::{
 };
 use reth::providers::providers::ConsistentDbView;
 use reth_errors::ProviderError;
-use reth_provider::{BlockReader, DatabaseProviderFactory};
+use reth_provider::{BlockReader, DatabaseProviderFactory, StateCommitmentProvider};
 use tokio::sync::broadcast::{
     self,
     error::{RecvError, TryRecvError},
@@ -17,25 +18,26 @@ use tokio::sync::broadcast::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, trace, warn};
 
-use crate::{
-    building::evm_inspector::SlotKey, live_builder::simulation::SimulatedOrderCommand,
-    primitives::SimulatedOrder,
-};
+use crate::{building::evm_inspector::SlotKey, live_builder::simulation::SimulatedOrderCommand};
 
 const CONSUME_SIM_ORDERS_BATCH: usize = 128;
 
 /// Runs a process that prefetches pieces of the trie based on the slots used by the order in simulation
 /// Its a blocking call so it should be spawned on the separate thread.
 pub fn run_trie_prefetcher<P>(
-    parent_hash: B256,
+    parent_num_hash: BlockNumHash,
     shared_sparse_mpt_cache: SparseTrieSharedCache,
     provider: P,
     mut simulated_orders: broadcast::Receiver<SimulatedOrderCommand>,
     cancel: CancellationToken,
 ) where
     P: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync + Clone,
+    P: StateCommitmentProvider,
 {
-    let consistent_db_view = ConsistentDbView::new(provider, Some(parent_hash));
+    let consistent_db_view = ConsistentDbView::new(
+        provider,
+        Some((parent_num_hash.hash, parent_num_hash.number)),
+    );
 
     // here we mark data that was fetched for this slot before
     let mut fetched_accounts: HashSet<Address> = HashSet::default();
@@ -54,11 +56,12 @@ pub fn run_trie_prefetcher<P>(
 
         for _ in 0..CONSUME_SIM_ORDERS_BATCH {
             match simulated_orders.try_recv() {
-                Ok(SimulatedOrderCommand::Simulation(SimulatedOrder {
-                    used_state_trace: Some(used_state_trace),
-                    ..
-                })) => {
-                    used_state_traces.push(used_state_trace);
+                Ok(SimulatedOrderCommand::Simulation(sim_order)) => {
+                    if let Some(used_state_trace) = &sim_order.used_state_trace {
+                        used_state_traces.push(used_state_trace.clone());
+                    } else {
+                        continue;
+                    }
                 }
                 Ok(_) => continue,
                 Err(TryRecvError::Empty) => {
@@ -67,11 +70,12 @@ pub fn run_trie_prefetcher<P>(
                     }
                     // block so thread can sleep if there are no inputs
                     match simulated_orders.blocking_recv() {
-                        Ok(SimulatedOrderCommand::Simulation(SimulatedOrder {
-                            used_state_trace: Some(used_state_trace),
-                            ..
-                        })) => {
-                            used_state_traces.push(used_state_trace);
+                        Ok(SimulatedOrderCommand::Simulation(sim_order)) => {
+                            if let Some(used_state_trace) = &sim_order.used_state_trace {
+                                used_state_traces.push(used_state_trace.clone());
+                            } else {
+                                continue;
+                            }
                         }
                         Ok(_) => continue,
                         Err(RecvError::Closed) => return,
@@ -151,7 +155,9 @@ pub fn run_trie_prefetcher<P>(
                 return;
             }
             Err(err) => {
-                error!(?err, "Error while prefetching trie nodes");
+                if !err.is_db_consistency_error() {
+                    error!(?err, "Error while prefetching trie nodes");
+                }
             }
         }
         trace!(

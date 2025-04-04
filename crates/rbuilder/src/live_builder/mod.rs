@@ -1,4 +1,5 @@
 pub mod base_config;
+pub mod block_list_provider;
 pub mod block_output;
 pub mod building;
 pub mod cli;
@@ -19,16 +20,19 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
+    primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
     primitives::constraints::SignedConstraints,
     provider::StateProviderFactory,
-    telemetry::inc_active_slots,
+    telemetry::{inc_active_slots, mark_building_started, reset_histogram_metrics},
     utils::{
-        error_storage::spawn_error_storage_writer, provider_head_state::ProviderHeadState, Signer,
+        error_storage::spawn_error_storage_writer, format_offset_datetime_rfc3339,
+        provider_head_state::ProviderHeadState, Signer,
     },
 };
 use ahash::{HashMap, HashSet};
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
+use block_list_provider::BlockListProvider;
 use building::BlockBuildingPool;
 use constraint_client::ConstraintSubscriber;
 use ethereum_consensus::configs::mainnet::SECONDS_PER_SLOT;
@@ -36,13 +40,18 @@ use eyre::Context;
 use jsonrpsee::RpcModule;
 use order_input::ReplaceableOrderPoolCommand;
 use parking_lot::RwLock;
-use payload_events::MevBoostSlotData;
+use payload_events::{InternalPayloadId, MevBoostSlotData};
+use reth::transaction_pool::{
+    BlobStore, EthPooledTransaction, Pool, TransactionListenerKind, TransactionOrdering,
+    TransactionPool, TransactionValidator,
+};
 use reth_chainspec::ChainSpec;
+use reth_primitives::{Recovered, TransactionSigned};
 use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct TimingsConfig {
@@ -112,7 +121,7 @@ where
 
     pub coinbase_signer: Signer,
     pub extra_data: Vec<u8>,
-    pub blocklist: HashSet<Address>,
+    pub blocklist_provider: Arc<dyn BlockListProvider>,
 
     pub global_cancellation: CancellationToken,
 
@@ -152,7 +161,10 @@ where
     }
 
     pub async fn run(self) -> eyre::Result<()> {
-        info!("Builder block list size: {}", self.blocklist.len(),);
+        info!(
+            "Builder initial block list size: {}",
+            self.blocklist_provider.get_blocklist()?.len(),
+        );
         info!(
             "Builder coinbase address: {:?}",
             self.coinbase_signer.address
@@ -235,35 +247,41 @@ where
         });
 
         while let Some(payload) = payload_events_channel.recv().await {
-            if self.blocklist.contains(&payload.fee_recipient()) {
+            reset_histogram_metrics();
+
+            let blocklist = self.blocklist_provider.get_blocklist()?;
+            if blocklist.contains(&payload.fee_recipient()) {
                 warn!(
-                    slot = payload.slot(),
-                    "Fee recipient is in blocklist: {:?}",
-                    payload.fee_recipient()
-                );
+                        slot = payload.slot(),
+                        fee_recipient = ?payload.fee_recipient(),
+                payload_id = payload.payload_id,
+                        "Fee recipient is in blocklist"
+                    );
                 continue;
             }
             let current_time = OffsetDateTime::now_utc();
             // see if we can get parent header in a reasonable time
             let time_to_slot = payload.timestamp() - current_time;
             debug!(
-                slot = payload.slot(),
-                block = payload.block(),
-                ?current_time,
-                payload_timestamp = ?payload.timestamp(),
-                ?time_to_slot,
-                parent_hash = ?payload.parent_block_hash(),
-                provider_head_state = ?ProviderHeadState::new(&self.provider),
-                "Received payload, time till slot timestamp",
-            );
+                    slot = payload.slot(),
+                    block = payload.block(),
+            payload_id = payload.payload_id,
+                    payload_timestamp = format_offset_datetime_rfc3339(&payload.timestamp()),
+                    time_to_slot_s = time_to_slot.as_seconds_f64(),
+                    parent_hash = ?payload.parent_block_hash(),
+                    provider_head_state = ?ProviderHeadState::new(&self.provider),
+                    "Received payload, time till slot timestamp",
+                );
 
             let time_until_slot_end = time_to_slot + timings.slot_proposal_duration;
             if time_until_slot_end.is_negative() {
                 warn!(
-                    slot = payload.slot(),
-                    parent_hash = ?payload.parent_block_hash(),
-                    "Slot already ended, skipping block building"
-                );
+                        slot = payload.slot(),
+                        block = payload.block(),
+                payload_id = payload.payload_id,
+                        parent_hash = ?payload.parent_block_hash(),
+                        "Slot already ended, skipping block building"
+                    );
                 continue;
             };
 
@@ -271,26 +289,36 @@ where
                 // @Nicer
                 let parent_block = payload.parent_block_hash();
                 let timestamp = payload.timestamp();
-                match wait_for_block_header(parent_block, timestamp, &self.provider, &timings).await
+                let block_number = payload.block();
+                match wait_for_block_header(
+                    block_number,
+                    parent_block,
+                    payload.payload_id,
+                    timestamp,
+                    &self.provider,
+                    &timings,
+                )
+                .await
                 {
                     Ok(header) => header,
                     Err(err) => {
-                        warn!(parent_hash = ?payload.parent_block_hash(),"Failed to get parent header for new slot: {:?}", err);
+                        warn!(payload_id = payload.payload_id, parent_hash = ?payload.parent_block_hash(), ?err, "Failed to get parent header for new slot");
                         continue;
                     }
                 }
             };
 
             debug!(
-                slot = payload.slot(),
-                block = payload.block(),
-                parent_hash = ?payload.parent_block_hash(),
-                "Got header for slot"
-            );
+                    slot = payload.slot(),
+                    block = payload.block(),
+            payload_id = payload.payload_id,
+                    parent_hash = ?payload.parent_block_hash(),
+                    "Got header for slot"
+                );
 
             // notify the order pool that there is a new header
             if let Err(err) = header_sender.send(parent_header.clone()).await {
-                warn!("Failed to send header to builder pool: {:?}", err);
+                warn!(?err, "Failed to send header to builder pool");
             }
 
             inc_active_slots();
@@ -317,19 +345,22 @@ where
                 None => debug!("No constraints cuttoff time, proceeding with block building"),
             };
 
-            let root_hasher = Arc::from(self.provider.root_hasher(payload.parent_block_hash()));
+            let root_hasher =
+                Arc::from(self.provider.root_hasher(payload.parent_block_num_hash())?);
 
             if let Some(block_ctx) = BlockBuildingContext::from_attributes(
                 payload.payload_attributes_event.clone(),
                 &parent_header,
-                self.coinbase_signer.clone(),
+                self.coinbase_signer,
                 self.chain_chain_spec.clone(),
-                self.blocklist.clone(),
+                blocklist.clone(),
                 Some(payload.suggested_gas_limit),
                 self.extra_data.clone(),
                 None,
                 root_hasher,
+                payload.payload_id,
             ) {
+                mark_building_started(block_ctx.timestamp());
                 builder_pool.start_block_building(
                     payload.clone(),
                     block_ctx,
@@ -337,7 +368,6 @@ where
                     time_until_slot_end.try_into().unwrap_or_default(),
                     self.constraint_store.read().get(&payload.slot()).cloned(),
                 );
-
                 if let Some(watchdog_sender) = watchdog_sender.as_ref() {
                     watchdog_sender.try_send(()).unwrap_or_default();
                 };
@@ -349,9 +379,46 @@ where
         for handle in inner_jobs_handles {
             handle
                 .await
-                .map_err(|err| warn!("Job handle await error: {:?}", err))
+                .map_err(|err| warn!(?err, "Job handle await error"))
                 .unwrap_or_default();
         }
+        Ok(())
+    }
+
+    /// Connect the builder to a reth [`TransactionPool`].
+    ///
+    /// This will
+    /// 1. Add pending and queued transactions to the [`OrderPool`]
+    /// 2. Subscribe to the pool directly, so the builder is not reliant on
+    ///    IPC to be notified of new transactions.
+    pub async fn connect_to_transaction_pool<V, T, S>(
+        &self,
+        pool: Pool<V, T, S>,
+    ) -> Result<(), eyre::Error>
+    where
+        V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
+        T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
+        S: BlobStore,
+    {
+        // Initialize the orderpool with every item in the reth pool.
+        for tx in pool
+            .all_transactions()
+            .pending_recovered()
+            .chain(pool.all_transactions().queued_recovered())
+        {
+            try_send_to_orderpool(tx, self.orderpool_sender.clone(), pool.clone()).await;
+        }
+
+        // Subscribe to new transactions in-process.
+        let mut recv = pool.new_transactions_listener_for(TransactionListenerKind::All);
+        let orderpool_sender = self.orderpool_sender.clone();
+        tokio::spawn(async move {
+            while let Some(e) = recv.recv().await {
+                let tx = e.transaction.transaction.transaction().clone();
+                try_send_to_orderpool(tx, orderpool_sender.clone(), pool.clone()).await;
+            }
+        });
+
         Ok(())
     }
 
@@ -369,7 +436,9 @@ where
 
 /// May fail if we wait too much (see [BLOCK_HEADER_DEAD_LINE_DELTA])
 async fn wait_for_block_header<P>(
-    block: B256,
+    block: u64,
+    parent_hash: B256,
+    payload_id: InternalPayloadId,
     slot_time: OffsetDateTime,
     provider: &P,
     timings: &TimingsConfig,
@@ -378,17 +447,38 @@ where
     P: StateProviderFactory,
 {
     let deadline = slot_time + timings.block_header_deadline_delta;
-    while OffsetDateTime::now_utc() < deadline {
-        if let Some(header) = provider.header(&block)? {
+    let mut sleep_duration: Option<Duration> = None;
+    loop {
+        if let Some(sleep_duration) = sleep_duration.take() {
+            tokio::time::sleep(sleep_duration).await;
+        }
+
+        if let Some(header) = provider.header(&parent_hash)? {
             return Ok(header);
         } else {
+            let current_parent_hash = provider
+                .header_by_number(block.checked_sub(1).unwrap_or(1))?
+                .map(|h| h.hash_slow());
+            info!(
+                block,
+                ?parent_hash,
+                ?current_parent_hash,
+                payload_id,
+                "Payload parent header not found, trying again"
+            );
+
             let time_to_sleep = min(
                 deadline - OffsetDateTime::now_utc(),
                 timings.get_block_header_period,
             );
             if time_to_sleep.is_negative() {
-                break;
+                sleep_duration = None;
+            } else {
+                sleep_duration = Some(time_to_sleep.try_into().unwrap());
             }
+        }
+
+        if OffsetDateTime::now_utc() > deadline {
             warn!(
                 block = ?block,
                 slot_time = ?slot_time,
@@ -396,8 +486,36 @@ where
                 "Block header not found, sleeping for {:?}",
                 time_to_sleep
             );
-            tokio::time::sleep(time_to_sleep.try_into().unwrap()).await;
+            break;
         }
     }
     Err(eyre::eyre!("Block header not found"))
+}
+
+/// Attempts to forward a [`Recovered<TransactionSigned>`] to an orderpool.
+///
+/// Helper for [`LiveBuilder::connect_to_transaction_pool`].
+///
+/// Errors are handled internally with a log.
+async fn try_send_to_orderpool<V, T, S>(
+    tx: Recovered<TransactionSigned>,
+    orderpool_sender: mpsc::Sender<ReplaceableOrderPoolCommand>,
+    pool: Pool<V, T, S>,
+) where
+    V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
+    T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
+    S: BlobStore,
+{
+    match TransactionSignedEcRecoveredWithBlobs::try_from_tx_without_blobs_and_pool(tx, pool) {
+        Ok(tx) => {
+            let order = Order::Tx(MempoolTx::new(tx));
+            let command = ReplaceableOrderPoolCommand::Order(order);
+            if let Err(e) = orderpool_sender.send(command).await {
+                error!("Error sending order to orderpool: {:#}", e);
+            }
+        }
+        Err(e) => {
+            error!("Error creating order from transaction: {:#}", e);
+        }
+    }
 }

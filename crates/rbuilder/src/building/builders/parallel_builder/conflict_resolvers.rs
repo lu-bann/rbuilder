@@ -1,5 +1,6 @@
 use ahash::HashMap;
 use alloy_primitives::{Address, U256};
+use derivative::Derivative;
 use eyre::Result;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, SeedableRng};
@@ -16,23 +17,22 @@ use super::{
 use crate::{
     building::{BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock},
     primitives::{OrderId, SimulatedOrder},
-    provider::StateProviderFactory,
 };
 
 /// Context for resolving conflicts in merging tasks.
-#[derive(Debug)]
-pub struct ResolverContext<P> {
-    pub provider: P,
+
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct ResolverContext {
+    #[derivative(Debug = "ignore")]
+    pub state: Arc<dyn StateProvider>,
     pub ctx: BlockBuildingContext,
     pub cancellation_token: CancellationToken,
     pub cache: Option<CachedReads>,
     pub simulation_cache: Arc<SharedSimulationCache>,
 }
 
-impl<P> ResolverContext<P>
-where
-    P: StateProviderFactory,
-{
+impl ResolverContext {
     /// Creates a new `ResolverContext`.
     ///
     /// # Arguments
@@ -43,14 +43,14 @@ where
     /// * `cache` - Optional cached reads for optimization.
     /// * `simulation_cache` - Shared cache for simulation results.
     pub fn new(
-        provider: P,
+        state: Arc<dyn StateProvider>,
         ctx: BlockBuildingContext,
         cancellation_token: CancellationToken,
         cache: Option<CachedReads>,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Self {
         ResolverContext {
-            provider,
+            state,
             ctx,
             cancellation_token,
             cache,
@@ -73,10 +73,6 @@ where
             task.group.id,
             task.algorithm
         );
-        let state_provider = self
-            .provider
-            .history_by_block_hash(self.ctx.attributes.parent)?;
-        let state_provider: Arc<dyn StateProvider> = Arc::from(state_provider);
 
         let sequence_to_try = generate_sequences_of_orders_to_try(&task);
 
@@ -87,7 +83,7 @@ where
 
         for sequence_of_orders in sequence_to_try {
             let (resolution_result, state) =
-                self.process_sequence_of_orders(sequence_of_orders, &task, &state_provider)?;
+                self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone())?;
             self.update_best_result(resolution_result, &mut best_resolution_result);
 
             let (new_cached_reads, _, _) = state.into_parts();
@@ -135,7 +131,7 @@ where
         &mut self,
         sequence_of_orders: Vec<usize>,
         task: &ConflictTask,
-        state_provider: &Arc<dyn StateProvider>,
+        state_provider: Arc<dyn StateProvider>,
     ) -> Result<(ResolutionResult, BlockState)> {
         let order_id_to_index = self.initialize_order_id_to_index_map(task);
         let full_sequence_of_orders = self.initialize_full_order_ids_vec(&sequence_of_orders, task);
@@ -146,7 +142,7 @@ where
             .get_cached_state(&full_sequence_of_orders);
 
         // Initialize state and partial block
-        let mut partial_block = PartialBlock::new(true, None);
+        let mut partial_block = PartialBlock::new(true);
         let mut state = self.initialize_block_state(&cached_state_option, state_provider);
         partial_block.pre_block_call(&self.ctx, &mut state)?;
 
@@ -175,7 +171,7 @@ where
             }
 
             let sim_order = &task.group.orders[order_idx];
-            match partial_block.commit_order(sim_order, &self.ctx, &mut state)? {
+            match partial_block.commit_order(sim_order, &self.ctx, &mut state, &|_| Ok(()))? {
                 Ok(res) => self.handle_successful_commit(
                     res,
                     sim_order,
@@ -286,7 +282,7 @@ where
     fn initialize_block_state(
         &mut self,
         cached_state_option: &Option<Arc<CachedSimulationState>>,
-        state_provider: &Arc<dyn StateProvider>,
+        state_provider: Arc<dyn StateProvider>,
     ) -> BlockState {
         if let Some(cached_state) = &cached_state_option {
             // Use cached state
@@ -296,9 +292,9 @@ where
         } else {
             // If we don't have a cached state from the simulation cache, we use the cached reads from the block state in some cases
             if let Some(cache) = &self.cache {
-                BlockState::new_arc(state_provider.clone()).with_cached_reads(cache.clone())
+                BlockState::new_arc(state_provider).with_cached_reads(cache.clone())
             } else {
-                BlockState::new_arc(state_provider.clone())
+                BlockState::new_arc(state_provider)
             }
         }
     }
@@ -466,7 +462,8 @@ mod tests {
     use ahash::HashSet;
     use alloy_consensus::TxLegacy;
     use alloy_primitives::{Address, TxHash, B256, U256};
-    use reth::primitives::{Transaction, TransactionSigned, TransactionSignedEcRecovered};
+    use reth::primitives::TransactionSigned;
+    use reth_primitives::{Recovered, Transaction};
     use uuid::Uuid;
 
     use super::*;
@@ -474,7 +471,7 @@ mod tests {
         building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority},
         primitives::{
             Bundle, Metadata, Order, SimValue, SimulatedOrder,
-            TransactionSignedEcRecoveredWithBlobs,
+            TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
         },
     };
 
@@ -499,17 +496,17 @@ mod tests {
             TxHash::from(self.create_u256())
         }
 
-        pub fn create_tx(&mut self) -> TransactionSignedEcRecovered {
+        pub fn create_tx(&mut self) -> Recovered<TransactionSigned> {
             let tx_legacy = TxLegacy {
                 nonce: self.create_u64(),
                 ..Default::default()
             };
-            TransactionSignedEcRecovered::from_signed_transaction(
-                TransactionSigned {
-                    hash: self.create_hash(),
-                    transaction: Transaction::Legacy(tx_legacy),
-                    ..Default::default()
-                },
+            Recovered::new_unchecked(
+                TransactionSigned::new(
+                    Transaction::Legacy(tx_legacy),
+                    alloy_primitives::PrimitiveSignature::test_signature(),
+                    self.create_hash(),
+                ),
                 Address::default(),
             )
         }
@@ -519,7 +516,7 @@ mod tests {
             coinbase_profit: U256,
             mev_gas_price: U256,
             num_of_orders: usize,
-        ) -> SimulatedOrder {
+        ) -> Arc<SimulatedOrder> {
             let mut txs = Vec::new();
             for _ in 0..num_of_orders {
                 txs.push(
@@ -534,7 +531,7 @@ mod tests {
             };
 
             let bundle = Bundle {
-                block: 0,
+                block: Some(0),
                 min_timestamp: None,
                 max_timestamp: None,
                 txs,
@@ -544,20 +541,23 @@ mod tests {
                 replacement_data: None,
                 signer: None,
                 metadata: Metadata::default(),
+                dropping_tx_hashes: Vec::new(),
+                refund: None,
+                version: LAST_BUNDLE_VERSION,
             };
 
-            SimulatedOrder {
+            Arc::new(SimulatedOrder {
                 order: Order::Bundle(bundle),
                 used_state_trace: None,
                 sim_value,
-            }
+            })
         }
     }
 
     // Helper function to create an order group
     fn create_mock_order_group(
         id: GroupId,
-        orders: Vec<SimulatedOrder>,
+        orders: Vec<Arc<SimulatedOrder>>,
         conflicting_ids: HashSet<GroupId>,
     ) -> ConflictGroup {
         ConflictGroup {

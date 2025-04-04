@@ -10,7 +10,9 @@ use rbuilder::{
     beacon_api_client::Client,
     building::{
         builders::{
-            block_building_helper::{BlockBuildingHelper, BlockBuildingHelperFromProvider},
+            block_building_helper::{
+                BiddableUnfinishedBlock, BlockBuildingHelper, BlockBuildingHelperFromProvider,
+            },
             BlockBuildingAlgorithm, BlockBuildingAlgorithmInput, OrderConsumer,
             UnfinishedBlockBuildingSink, UnfinishedBlockBuildingSinkFactory,
         },
@@ -21,19 +23,18 @@ use rbuilder::{
             default_ip, DEFAULT_EL_NODE_IPC_PATH, DEFAULT_INCOMING_BUNDLES_PORT,
             DEFAULT_RETH_DB_PATH,
         },
+        block_list_provider::NullBlockListProvider,
         config::create_provider_factory,
         order_input::{
-            OrderInputConfig, DEFAULT_INPUT_CHANNEL_BUFFER_SIZE, DEFAULT_RESULTS_CHANNEL_TIMEOUT,
-            DEFAULT_SERVE_MAX_CONNECTIONS,
+            MempoolSource, OrderInputConfig, DEFAULT_INPUT_CHANNEL_BUFFER_SIZE,
+            DEFAULT_RESULTS_CHANNEL_TIMEOUT, DEFAULT_SERVE_MAX_CONNECTIONS,
         },
         payload_events::{MevBoostSlotData, MevBoostSlotDataGenerator},
         simulation::SimulatedOrderCommand,
         LiveBuilder,
     },
-    primitives::{
-        mev_boost::{MevBoostRelay, RelayConfig},
-        SimulatedOrder,
-    },
+    mev_boost::RelayClient,
+    primitives::{mev_boost::MevBoostRelaySlotInfoProvider, SimulatedOrder},
     provider::StateProviderFactory,
     utils::{ProviderFactoryReopener, Signer},
 };
@@ -61,23 +62,21 @@ async fn main() -> eyre::Result<()> {
     let chain_spec = MAINNET.clone();
     let cancel = CancellationToken::new();
 
-    let relay_config = RelayConfig::default().
-        with_url("https://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@boost-relay.flashbots.net").
-        with_name("flashbots");
-
-    let relay = MevBoostRelay::from_config(&relay_config)?;
-
+    let flashbots_relay_url = "https://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@boost-relay.flashbots.net";
+    let relay_client = RelayClient::from_url(flashbots_relay_url.parse()?, None, None, None);
+    let relay = MevBoostRelaySlotInfoProvider::new(relay_client, "flashbots".to_string());
+    let blocklist_provider = Arc::new(NullBlockListProvider::new());
     let payload_event = MevBoostSlotDataGenerator::new(
         vec![Client::default()],
         vec![relay],
-        Default::default(),
+        blocklist_provider.clone(),
         cancel.clone(),
     );
 
     let order_input_config = OrderInputConfig::new(
         false,
         true,
-        Some(PathBuf::from(DEFAULT_EL_NODE_IPC_PATH)),
+        Some(MempoolSource::Ipc(PathBuf::from(DEFAULT_EL_NODE_IPC_PATH))),
         DEFAULT_INCOMING_BUNDLES_PORT,
         default_ip(),
         DEFAULT_SERVE_MAX_CONNECTIONS,
@@ -105,7 +104,7 @@ async fn main() -> eyre::Result<()> {
         )?,
         coinbase_signer: Signer::random(),
         extra_data: Vec::new(),
-        blocklist: Default::default(),
+        blocklist_provider,
         global_cancellation: cancel.clone(),
         extra_rpc: RpcModule::new(()),
         sink_factory: Box::new(TraceBlockSinkFactory {}),
@@ -148,9 +147,9 @@ impl UnfinishedBlockBuildingSinkFactory for TraceBlockSinkFactory {
 struct TracingBlockSink {}
 
 impl UnfinishedBlockBuildingSink for TracingBlockSink {
-    fn new_block(&self, block: Box<dyn BlockBuildingHelper>) {
+    fn new_block(&self, block: BiddableUnfinishedBlock) {
         info!(
-            order_count =? block.built_block_trace().included_orders.len(),
+            order_count =? block.block().built_block_trace().included_orders.len(),
             "Block generated. Throwing it away!"
         );
     }
@@ -168,7 +167,7 @@ impl UnfinishedBlockBuildingSink for TracingBlockSink {
 /// This is a NOT real builder some data is not filled correctly (eg:BuiltBlockTrace)
 #[derive(Debug)]
 struct DummyBuildingAlgorithm {
-    /// Amnount of used orders to build a block
+    /// Amount of used orders to build a block
     orders_to_use: usize,
 }
 
@@ -183,14 +182,14 @@ impl DummyBuildingAlgorithm {
         &self,
         cancel: &CancellationToken,
         orders_source: broadcast::Receiver<SimulatedOrderCommand>,
-    ) -> Option<Vec<SimulatedOrder>> {
+    ) -> Option<Vec<Arc<SimulatedOrder>>> {
         let mut orders_sink = SimulatedOrderStore::new();
         let mut order_consumer = OrderConsumer::new(orders_source);
         loop {
             if cancel.is_cancelled() {
                 break None;
             }
-            order_consumer.consume_next_commands().unwrap();
+            order_consumer.blocking_consume_next_commands().unwrap();
             order_consumer.apply_new_commands(&mut orders_sink);
             let orders = orders_sink.get_orders();
             if orders.len() >= self.orders_to_use {
@@ -202,26 +201,29 @@ impl DummyBuildingAlgorithm {
 
     fn build_block<P>(
         &self,
-        orders: Vec<SimulatedOrder>,
+        orders: Vec<Arc<SimulatedOrder>>,
         provider: P,
         ctx: &BlockBuildingContext,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>>
     where
         P: StateProviderFactory + Clone + 'static,
     {
+        let block_state = provider
+            .history_by_block_hash(ctx.attributes.parent)?
+            .into();
+
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
-            provider.clone(),
+            block_state,
             ctx.clone(),
             None,
             BUILDER_NAME.to_string(),
             false,
-            None,
             CancellationToken::new(),
         )?;
 
         for order in orders {
             // don't care about the result
-            let _ = block_building_helper.commit_order(&order)?;
+            let _ = block_building_helper.commit_order(&order, &|_| Ok(()))?;
         }
         Ok(Box::new(block_building_helper))
     }
@@ -240,7 +242,9 @@ where
             let block = self
                 .build_block(orders, input.provider, &input.ctx)
                 .unwrap();
-            input.sink.new_block(block);
+            if let Ok(block) = BiddableUnfinishedBlock::new(block) {
+                input.sink.new_block(block);
+            }
         }
     }
 }

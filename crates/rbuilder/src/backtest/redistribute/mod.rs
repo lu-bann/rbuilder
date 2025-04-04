@@ -14,7 +14,7 @@ use crate::{
         },
         BlockData, BuiltBlockData, OrdersWithTimestamp,
     },
-    live_builder::cli::LiveBuilderConfig,
+    live_builder::{block_list_provider::BlockList, cli::LiveBuilderConfig},
     primitives::{Order, OrderId},
     provider::StateProviderFactory,
     utils::{signed_uint_delta, u256decimal_serde_helper},
@@ -28,9 +28,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::{max, min},
     sync::Arc,
+    time::Instant,
 };
-use tracing::{debug, info, info_span, trace, warn};
+use tracing::{debug, error, info, info_span, trace, warn};
 use uuid::Uuid;
+
+use super::OrderFilteredReason;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +124,7 @@ pub fn calc_redistributions<P, ConfigType>(
     config: &ConfigType,
     block_data: BlockData,
     distribute_to_mempool_txs: bool,
+    blocklist: BlockList,
 ) -> eyre::Result<RedistributionBlockOutput>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -129,7 +133,14 @@ where
     let _block_span = info_span!("block", block = block_data.block_number).entered();
     let protect_signers = config.base_config().backtest_protect_bundle_signers.clone();
 
-    let (onchain_block_profit, block_data, built_block_data) = prepare_block_data(block_data)?;
+    info!(?protect_signers, "Protect signers");
+    if protect_signers.is_empty() {
+        warn!("Protect signers are not set");
+    }
+
+    let start = Instant::now();
+    let (onchain_block_profit, block_data, built_block_data) =
+        prepare_block_data(config, block_data)?;
 
     let included_orders_available =
         get_available_orders(&block_data, &built_block_data, distribute_to_mempool_txs);
@@ -148,8 +159,18 @@ where
         distribute_to_mempool_txs,
     );
 
-    let results_without_exclusion =
-        calculate_backtest_without_exclusion(provider.clone(), config, block_data.clone())?;
+    let time_preparation_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let start = Instant::now();
+
+    let results_without_exclusion = calculate_backtest_without_exclusion(
+        provider.clone(),
+        config,
+        block_data.clone(),
+        blocklist.clone(),
+    )?;
+
+    let time_no_exclusion_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let start = Instant::now();
 
     let exclusion_results = calculate_backtest_identity_and_order_exclusion(
         provider.clone(),
@@ -157,7 +178,11 @@ where
         block_data.clone(),
         &available_orders,
         &results_without_exclusion,
+        blocklist.clone(),
     )?;
+
+    let time_single_exclusion_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let start = Instant::now();
 
     let exclusion_results = calc_joint_exclusion_results(
         provider.clone(),
@@ -167,7 +192,11 @@ where
         &results_without_exclusion,
         exclusion_results,
         distribute_to_mempool_txs,
+        blocklist.clone(),
     )?;
+
+    let time_joint_exclusion_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let start = Instant::now();
 
     let calculated_redistribution_result = apply_redistribution_formula(
         onchain_block_profit,
@@ -197,6 +226,25 @@ where
         .map(|o| o.redistribution_value_received)
         .sum::<U256>();
 
+    let time_result_s = start.elapsed().as_millis() as f64 / 1000.0;
+
+    let time_total_s = time_preparation_s
+        + time_no_exclusion_s
+        + time_single_exclusion_s
+        + time_joint_exclusion_s
+        + time_result_s;
+    info!(
+        block_profit = format_ether(onchain_block_profit),
+        redistributed = format_ether(redistributed_identity_value),
+        time_total_s,
+        time_preparation_s,
+        time_no_exclusion_s,
+        time_single_exclusion_s,
+        time_joint_exclusion_s,
+        time_result_s,
+        "Calculated redistribution"
+    );
+
     assert!(
         redistributed_identity_value <= onchain_block_profit,
         "Redistributed identity value is greater than onchain block profit"
@@ -209,26 +257,71 @@ where
     Ok(result)
 }
 
-fn prepare_block_data(
+fn prepare_block_data<ConfigType>(
+    config: &ConfigType,
     mut block_data: BlockData,
-) -> eyre::Result<(U256, BlockData, BuiltBlockData)> {
+) -> eyre::Result<(U256, BlockData, BuiltBlockData)>
+where
+    ConfigType: LiveBuilderConfig,
+{
     let built_block_data = if let Some(block_data) = block_data.built_block_data.clone() {
         block_data
     } else {
-        warn!(block = block_data.block_number, "Block data not found");
+        error!(block = block_data.block_number, "Block data not found");
         eyre::bail!("Included block data not found");
     };
+
+    let config_coinbase_signer = config.base_config().coinbase_signer()?.address;
+    let block_coinbase = block_data.onchain_block.header.beneficiary;
+    if config_coinbase_signer != block_coinbase {
+        warn!(
+            ?block_coinbase,
+            ?config_coinbase_signer,
+            "Onchain block coinbase does not match config coinbase signer"
+        );
+    }
+
+    let orders_before_filtering = block_data.available_orders.len();
 
     block_data.filter_orders_by_end_timestamp(built_block_data.orders_closed_at);
     // @TODO filter cancellations properly, for this we need actual cancellations in the backtest data
     // filter bundles made out of mempool txs
     block_data.filter_bundles_from_mempool();
 
+    let filtered = orders_before_filtering - block_data.available_orders.len();
+
+    let mut txs = 0;
+    let mut bundles = 0;
+    let mut share_bundles = 0;
+    for ts_order in &block_data.available_orders {
+        match &ts_order.order {
+            Order::Bundle(_) => bundles += 1,
+            Order::Tx(_) => txs += 1,
+            Order::ShareBundle(_) => share_bundles += 1,
+        }
+    }
+    let total = txs + bundles + share_bundles;
+
+    info!(
+        total,
+        txs, bundles, share_bundles, filtered, "Available orders"
+    );
+    if txs == 0 {
+        error!("Block has no mempool txs");
+    }
+    if bundles == 0 {
+        warn!("Block has no bundles");
+    }
+    if share_bundles == 0 {
+        warn!("Block has no share bundles");
+    }
+
     let block_profit = if built_block_data.profit.is_positive() {
         built_block_data.profit.into_sign_and_abs().1
     } else {
         U256::ZERO
     };
+
     Ok((block_profit, block_data, built_block_data))
 }
 
@@ -249,9 +342,17 @@ fn get_available_orders(
             Some(order) => {
                 included_orders_available.insert(order.order.id(), order.clone());
             }
-            None => {
-                warn!(order = ?id, "Included order not found in available orders");
-            }
+            None => match block_data.filtered_orders.get(id) {
+                Some(OrderFilteredReason::MempoolTxs) => {
+                    info!(order = ?id, "Included order was filtered because all txs are from mempool");
+                }
+                Some(reason) => {
+                    error!(order = ?id, ?reason, "Included order was filtered from available orders");
+                }
+                None => {
+                    error!(order = ?id, "Included order not found in available orders");
+                }
+            },
         }
     }
     if distribute_to_mempool_txs {
@@ -264,6 +365,7 @@ fn get_available_orders(
     }
     let mut included_orders_available = included_orders_available.into_values().collect::<Vec<_>>();
     included_orders_available.sort_by_key(|order| order.order.id());
+
     included_orders_available
 }
 
@@ -388,10 +490,17 @@ fn split_orders_by_identities(
     let mut bundle_hash_by_id = HashMap::default();
     let mut order_sender_by_id = HashMap::default();
 
+    let mut protect_signer_seen = false;
+
     for order in &included_orders_available {
         let order_id = order.order.id();
         let address = match order_redistribution_address(&order.order, protect_signers) {
-            Some(address) => address,
+            Some((address, protect_signer)) => {
+                if protect_signer {
+                    protect_signer_seen = true;
+                }
+                address
+            }
             None => {
                 warn!(order = ?order_id, "Included order redistribution address not found");
                 continue;
@@ -410,7 +519,12 @@ fn split_orders_by_identities(
         };
         order_sender_by_id.insert(id, order_sender(&order.order));
         let address = match order_redistribution_address(&order.order, protect_signers) {
-            Some(address) => address,
+            Some((address, protect_signer)) => {
+                if protect_signer {
+                    protect_signer_seen = true;
+                }
+                address
+            }
             None => {
                 warn!(order = ?id, "Available order redistribution address not found");
                 continue;
@@ -432,6 +546,10 @@ fn split_orders_by_identities(
         let orders = all_orders_by_address.entry(address).or_default();
         orders.push(id);
         orders_id_to_address.insert(id, address);
+    }
+
+    if !protect_signer_seen {
+        warn!("No orders from protect signer");
     }
 
     let mut included_orders_by_address: Vec<(Address, Vec<OrderId>)> =
@@ -478,6 +596,7 @@ fn calculate_backtest_without_exclusion<P, ConfigType>(
     provider: P,
     config: &ConfigType,
     block_data: BlockData,
+    blocklist: BlockList,
 ) -> eyre::Result<ResultsWithoutExclusion>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -498,6 +617,7 @@ where
             orders_excluded_before: vec![],
             profit_before: U256::ZERO,
         },
+        blocklist,
     )?;
     Ok(ResultsWithoutExclusion {
         profit,
@@ -543,6 +663,7 @@ fn calculate_backtest_identity_and_order_exclusion<P, ConfigType>(
     block_data: BlockData,
     available_orders: &AvailableOrders,
     results_without_exclusion: &ResultsWithoutExclusion,
+    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -572,6 +693,7 @@ where
                     config,
                     &block_data,
                     results_without_exclusion.exclusion_input(exclusions),
+                    blocklist.clone(),
                 )
                 .map(|ok| (id, ok))
             })
@@ -593,6 +715,7 @@ where
                 config,
                 &block_data,
                 results_without_exclusion.exclusion_input(orders),
+                blocklist.clone(),
             )
             .map(|ok| (address, ok))
         })
@@ -605,6 +728,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn calc_joint_exclusion_results<P, ConfigType>(
     provider: P,
     config: &ConfigType,
@@ -613,6 +737,7 @@ fn calc_joint_exclusion_results<P, ConfigType>(
     results_without_exclusion: &ResultsWithoutExclusion,
     mut exclusion_results: ExclusionResults,
     distribute_to_mempool_txs: bool,
+    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -652,7 +777,7 @@ where
                 .expect("order address not found");
             if address1 != address2 {
                 joint_contribution_todo.push((min(address1, address2), max(address1, address2)));
-                warn!(address1 = ?address1, order1 = ?order, address2 = ?address2, order2 = ?new_failed_order, "Possible identity conflict");
+                info!(address1 = ?address1, order1 = ?order, address2 = ?address2, order2 = ?new_failed_order, "Possible identity conflict");
             }
         }
     }
@@ -679,6 +804,7 @@ where
                 config,
                 &block_data,
                 results_without_exclusion.exclusion_input(orders),
+                blocklist.clone(),
             )
             .map(|ok| ((address1, address2), ok))
         })
@@ -687,7 +813,7 @@ where
     for ((address1, address2), result) in &exclusion_results.joint_exclusion_result {
         let block_value_delta = result.block_value_delta;
         if !block_value_delta.is_positive() {
-            warn!(?address1, ?address2, newly_included_orders = ?result.new_orders_included, "Joint block value delta is not positive");
+            info!(?address1, ?address2, newly_included_orders = ?result.new_orders_included, "Joint block value delta is not positive");
         };
         let bvd1 = exclusion_results
             .identity_exclusion(address1)
@@ -696,7 +822,7 @@ where
             .identity_exclusion(address2)
             .block_value_delta;
         if bvd1 + bvd2 > block_value_delta {
-            warn!(address1 = ?address1, address2 = ?address2, sum = format_ether(bvd1 + bvd2), joint=format_ether(block_value_delta), "Joint block value delta is smaller than sum of individual block value deltas");
+            info!(address1 = ?address1, address2 = ?address2, sum = format_ether(bvd1 + bvd2), joint=format_ether(block_value_delta), "Joint block value delta is smaller than sum of individual block value deltas");
         }
     }
 
@@ -724,7 +850,7 @@ fn apply_redistribution_formula(
 
             let realized_value = restored_landed_order.unique_coinbase_profit;
             if !realized_value.is_positive() {
-                warn!(identity = ?address, order = ?id, realized_value = format_ether(realized_value), "Order unique coinbase profit is not positive");
+                info!(identity = ?address, order = ?id, realized_value = format_ether(realized_value), "Order unique coinbase profit is not positive");
                 continue;
             }
             let realized_value = realized_value.into_sign_and_abs().1;
@@ -738,7 +864,7 @@ fn apply_redistribution_formula(
             .identity_exclusion(address)
             .block_value_delta;
         if !block_value_delta.is_positive() {
-            warn!(identity = ?address, block_value_delta = format_ether(block_value_delta), "Identity block value delta is not positive");
+            info!(identity = ?address, block_value_delta = format_ether(block_value_delta), "Identity block value delta is not positive");
             continue;
         }
         let block_value_delta = block_value_delta.into_sign_and_abs().1;
@@ -946,6 +1072,7 @@ fn calc_profit_after_exclusion<P, ConfigType>(
     config: &ConfigType,
     block_data: &BlockData,
     exclusion_input: ExclusionInput,
+    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResult>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -971,19 +1098,13 @@ where
 
     let base_config = config.base_config();
 
-    // we set built_block_lag_ms to 0 here because we already prefiltered all the orders
-    // in built_block_data, so we essentially just disable filtering in the `backtest_simulate_block`
-    // but we still filter by the relay timestamp
-    let built_block_lag_ms = 0;
-
     let result = backtest_simulate_block(
         block_data_with_excluded,
         provider.clone(),
         base_config.chain_spec()?,
-        built_block_lag_ms,
         base_config.backtest_builders.clone(),
         config,
-        base_config.blocklist()?,
+        blocklist,
         &base_config.sbundle_mergeable_signers(),
     )?
     .builder_outputs
@@ -1025,12 +1146,16 @@ where
     })
 }
 
-fn order_redistribution_address(order: &Order, protect_signers: &[Address]) -> Option<Address> {
+// returns true if signer is from protect
+fn order_redistribution_address(
+    order: &Order,
+    protect_signers: &[Address],
+) -> Option<(Address, bool)> {
     let signer = match order.signer() {
         Some(signer) => signer,
         None => {
             return if order.is_tx() {
-                Some(order.list_txs().first()?.0.signer())
+                Some((order.list_txs().first()?.0.signer(), false))
             } else {
                 None
             }
@@ -1038,27 +1163,27 @@ fn order_redistribution_address(order: &Order, protect_signers: &[Address]) -> O
     };
 
     if !protect_signers.contains(&signer) {
-        return Some(signer);
+        return Some((signer, false));
     }
 
     match order {
         Order::Bundle(bundle) => {
             // if its just a bundle we take origin tx of the first transaction
             let tx = bundle.txs.first()?;
-            Some(tx.signer())
+            Some((tx.signer(), true))
         }
         Order::ShareBundle(bundle) => {
             // if it is a share bundle we take either
             // 1. first address from the refund config
             // 2. origin of the first tx
 
-            if let Some(first_refund) = bundle.inner_bundle.refund_config.first() {
-                return Some(first_refund.address);
+            if let Some(first_refund) = bundle.inner_bundle().refund_config.first() {
+                return Some((first_refund.address, true));
             }
 
             let txs = bundle.list_txs();
             let (first_tx, _) = txs.first()?;
-            Some(first_tx.signer())
+            Some((first_tx.signer(), true))
         }
         Order::Tx(_) => {
             unreachable!("Mempool tx order can't have signer");

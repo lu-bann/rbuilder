@@ -5,24 +5,29 @@ pub mod ordering_builder;
 pub mod parallel_builder;
 
 use crate::{
-    building::{BlockBuildingContext, BuiltBlockTrace, SimulatedOrderSink, Sorting},
-    live_builder::{payload_events::MevBoostSlotData, simulation::SimulatedOrderCommand},
+    building::{BlockBuildingContext, BuiltBlockTrace, SimulatedOrderSink},
+    live_builder::{
+        payload_events::{InternalPayloadId, MevBoostSlotData},
+        simulation::SimulatedOrderCommand,
+    },
     primitives::{constraints::SignedConstraints, AccountNonce, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
     utils::{is_provider_factory_health_error, NonceCache},
 };
 use ahash::HashSet;
 use alloy_eips::eip4844::BlobTransactionSidecar;
-use alloy_primitives::{Address, Bytes, B256};
-use block_building_helper::BlockBuildingHelper;
+use alloy_primitives::{Address, Bytes};
+use block_building_helper::BiddableUnfinishedBlock;
 use reth::{primitives::SealedBlock, revm::cached::CachedReads};
-use reth_errors::ProviderError;
 use std::{fmt::Debug, sync::Arc};
-use tokio::sync::{broadcast, broadcast::error::TryRecvError};
+use tokio::sync::{
+    broadcast,
+    broadcast::error::{RecvError, TryRecvError},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::{simulated_order_command_to_sink, PrioritizedOrderStore};
+use super::{simulated_order_command_to_sink, OrderPriority, PrioritizedOrderStore};
 
 /// Block we built
 #[derive(Debug, Clone)]
@@ -46,7 +51,7 @@ pub struct LiveBuilderInput<P> {
     pub cancel: CancellationToken,
 }
 
-/// Struct that helps reading new orders/cancelations
+/// Struct that helps reading new orders/cancellations
 /// Call consume_next_commands, check the new_commands() and then consume them via apply_new_commands.
 /// Call consume_next_cancellations and use cancel_data
 #[derive(Debug)]
@@ -67,7 +72,17 @@ impl OrderConsumer {
     /// Returns true if success, on false builder should stop
     /// New commands are accumulatd in self.new_commands
     /// Call apply_new_commands to easily consume them.
-    pub fn consume_next_commands(&mut self) -> eyre::Result<bool> {
+    /// This method will block until the first command is received
+    pub fn blocking_consume_next_commands(&mut self) -> eyre::Result<bool> {
+        match self.orders.blocking_recv() {
+            Ok(order) => self.new_commands.push(order),
+            Err(RecvError::Closed) => {
+                return Ok(false);
+            }
+            Err(RecvError::Lagged(msg)) => {
+                warn!(msg, "Builder thread lagging on sim orders channel");
+            }
+        }
         for _ in 0..1024 {
             match self.orders.try_recv() {
                 Ok(order) => self.new_commands.push(order),
@@ -78,7 +93,7 @@ impl OrderConsumer {
                     return Ok(false);
                 }
                 Err(TryRecvError::Lagged(msg)) => {
-                    warn!("Builder thread lagging on sim orders channel: {}", msg);
+                    warn!(msg, "Builder thread lagging on sim orders channel");
                     break;
                 }
             }
@@ -99,39 +114,30 @@ impl OrderConsumer {
 }
 
 #[derive(Debug)]
-pub struct OrderIntakeConsumer<P> {
-    nonce_cache: NonceCache<P>,
+pub struct OrderIntakeConsumer<OrderPriorityType> {
+    nonces: NonceCache,
 
-    block_orders: PrioritizedOrderStore,
+    block_orders: PrioritizedOrderStore<OrderPriorityType>,
     onchain_nonces_updated: HashSet<Address>,
 
     order_consumer: OrderConsumer,
 }
 
-impl<P> OrderIntakeConsumer<P>
-where
-    P: StateProviderFactory,
-{
+impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
     /// See [`ShareBundleMerger`] for sbundle_merger_selected_signers
-    pub fn new(
-        provider: P,
-        orders: broadcast::Receiver<SimulatedOrderCommand>,
-        parent_block: B256,
-        sorting: Sorting,
-    ) -> Self {
-        let nonce_cache = NonceCache::new(provider, parent_block);
-
+    pub fn new(nonces: NonceCache, orders: broadcast::Receiver<SimulatedOrderCommand>) -> Self {
         Self {
-            nonce_cache,
-            block_orders: PrioritizedOrderStore::new(sorting, vec![]),
+            nonces,
+            block_orders: PrioritizedOrderStore::new(vec![]),
             onchain_nonces_updated: HashSet::default(),
             order_consumer: OrderConsumer::new(orders),
         }
     }
 
     /// Returns true if success, on false builder should stop
-    pub fn consume_next_batch(&mut self) -> eyre::Result<bool> {
-        if !self.order_consumer.consume_next_commands()? {
+    /// Blocks until the first item in the next batch is available.
+    pub fn blocking_consume_next_batch(&mut self) -> eyre::Result<bool> {
+        if !self.order_consumer.blocking_consume_next_commands()? {
             return Ok(false);
         }
         if !self.update_onchain_nonces()? {
@@ -153,18 +159,13 @@ where
                 SimulatedOrderCommand::Simulation(sim_order) => Some(sim_order),
                 SimulatedOrderCommand::Cancellation(_) => None,
             });
-        let nonce_db_ref = match self.nonce_cache.get_ref() {
-            Ok(nonce_db_ref) => nonce_db_ref,
-            Err(ProviderError::BlockHashNotFound(_)) => return Ok(false), // This can happen on reorgs since the block is removed
-            Err(err) => return Err(err.into()),
-        };
         let mut nonces = Vec::new();
         for new_order in new_orders {
             for nonce in new_order.order.nonces() {
                 if self.onchain_nonces_updated.contains(&nonce.address) {
                     continue;
                 }
-                let onchain_nonce = nonce_db_ref.nonce(nonce.address)?;
+                let onchain_nonce = self.nonces.nonce(nonce.address)?;
                 nonces.push(AccountNonce {
                     account: nonce.address,
                     nonce: onchain_nonce,
@@ -176,21 +177,21 @@ where
         Ok(true)
     }
 
-    pub fn current_block_orders(&self) -> PrioritizedOrderStore {
+    pub fn current_block_orders(&self) -> PrioritizedOrderStore<OrderPriorityType> {
         self.block_orders.clone()
     }
 
     pub fn remove_orders(
         &mut self,
         orders: impl IntoIterator<Item = OrderId>,
-    ) -> Vec<SimulatedOrder> {
+    ) -> Vec<Arc<SimulatedOrder>> {
         self.block_orders.remove_orders(orders)
     }
 }
 
 /// Output of the BlockBuildingAlgorithm.
 pub trait UnfinishedBlockBuildingSink: std::fmt::Debug + Send + Sync {
-    fn new_block(&self, block: Box<dyn BlockBuildingHelper>);
+    fn new_block(&self, block: BiddableUnfinishedBlock);
 
     /// The sink may not like blocks where coinbase is the final fee_recipient (eg: this does not allows us to take profit!).
     /// Not sure this is the right place for this func. Might move somewhere else.
@@ -239,19 +240,23 @@ pub trait UnfinishedBlockBuildingSinkFactory: Debug + Send + Sync {
 pub struct BacktestSimulateBlockInput<'a, P> {
     pub ctx: BlockBuildingContext,
     pub builder_name: String,
-    pub sim_orders: &'a Vec<SimulatedOrder>,
+    pub sim_orders: &'a Vec<Arc<SimulatedOrder>>,
     pub provider: P,
     pub cached_reads: Option<CachedReads>,
 }
 
 /// Handles error from block filling stage.
 /// Answers if block filling should continue.
-pub fn handle_building_error(err: eyre::Report) -> bool {
+pub fn handle_building_error(err: eyre::Report, payload_id: InternalPayloadId) -> bool {
     // @Types
     let err_str = err.to_string();
     if !err_str.contains("Profit too low") {
         if is_provider_factory_health_error(&err) {
-            info!(?err, "Cancelling building due to provider factory error");
+            info!(
+                payload_id,
+                ?err,
+                "Cancelling building due to provider factory error"
+            );
             return false;
         } else {
             warn!(?err, "Error filling orders");

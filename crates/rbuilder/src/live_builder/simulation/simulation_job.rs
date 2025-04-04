@@ -1,10 +1,9 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use crate::{
     building::sim::{SimTree, SimulatedResult, SimulationRequest},
     live_builder::order_input::order_sink::OrderPoolCommand,
-    primitives::{Order, OrderId},
-    provider::StateProviderFactory,
+    primitives::{Order, OrderId, OrderReplacementKey},
 };
 use ahash::HashSet;
 use alloy_primitives::utils::format_ether;
@@ -25,7 +24,7 @@ use super::SimulatedOrderCommand;
 /// If we get a cancellation and the order is in in_flight_orders we just remove it from in_flight_orders.
 /// Only SimulatedOrders still in in_flight_orders are delivered.
 /// @Pending: implement cancellations in the SimTree.
-pub struct SimulationJob<P> {
+pub struct SimulationJob {
     block_cancellation: CancellationToken,
     /// Input orders to be simulated
     new_order_sub: mpsc::UnboundedReceiver<OrderPoolCommand>,
@@ -35,10 +34,16 @@ pub struct SimulationJob<P> {
     sim_results_receiver: mpsc::Receiver<SimulatedResult>,
     /// Output of the simulations
     slot_sim_results_sender: mpsc::Sender<SimulatedOrderCommand>,
-    sim_tree: SimTree<P>,
+    sim_tree: SimTree,
 
     orders_received: OrderCounter,
     orders_simulated_ok: OrderCounter,
+
+    unique_replacement_key_bundles: HashSet<OrderReplacementKey>,
+    orders_with_replacement_key: usize,
+
+    unique_replacement_key_bundles_sim_ok: HashSet<OrderReplacementKey>,
+    orders_with_replacement_key_sim_ok: usize,
 
     /// Orders we got via new_order_sub and are still being processed (they could be inside the SimTree or in the sim queue)
     /// and were not cancelled.
@@ -56,17 +61,14 @@ pub struct SimulationJob<P> {
     not_cancelled_sent_simulated_orders: HashSet<OrderId>,
 }
 
-impl<P> SimulationJob<P>
-where
-    P: StateProviderFactory,
-{
+impl SimulationJob {
     pub fn new(
         block_cancellation: CancellationToken,
         new_order_sub: mpsc::UnboundedReceiver<OrderPoolCommand>,
         sim_req_sender: flume::Sender<SimulationRequest>,
         sim_results_receiver: mpsc::Receiver<SimulatedResult>,
         slot_sim_results_sender: mpsc::Sender<SimulatedOrderCommand>,
-        sim_tree: SimTree<P>,
+        sim_tree: SimTree,
     ) -> Self {
         Self {
             block_cancellation,
@@ -77,6 +79,10 @@ where
             sim_tree,
             orders_received: OrderCounter::default(),
             orders_simulated_ok: OrderCounter::default(),
+            orders_with_replacement_key: 0,
+            unique_replacement_key_bundles: Default::default(),
+            orders_with_replacement_key_sim_ok: 0,
+            unique_replacement_key_bundles_sim_ok: Default::default(),
             in_flight_orders: Default::default(),
             not_cancelled_sent_simulated_orders: Default::default(),
         }
@@ -88,6 +94,10 @@ where
         info!(
             ?self.orders_received,
             ?self.orders_simulated_ok,
+        bundles_with_replace = self.orders_with_replacement_key,
+        unique_replace_count = self.unique_replacement_key_bundles.len(),
+        bundles_with_replace_sim_ok = self.orders_with_replacement_key_sim_ok,
+        unique_replace_count_sim_ok = self.unique_replacement_key_bundles_sim_ok.len(),
             "Stopping simulation job "
         );
     }
@@ -180,6 +190,10 @@ where
             "Order simulated");
             self.orders_simulated_ok
                 .accumulate(&sim_result.simulated_order.order);
+            if let Some(repl_key) = sim_result.simulated_order.order.replacement_key() {
+                self.unique_replacement_key_bundles_sim_ok.insert(repl_key);
+                self.orders_with_replacement_key_sim_ok += 1;
+            }
             // Skip cancelled orders and remove from in_flight_orders
             if self
                 .in_flight_orders
@@ -192,9 +206,9 @@ where
                     .insert(sim_result.simulated_order.id())
                     && self
                         .slot_sim_results_sender
-                        .send(SimulatedOrderCommand::Simulation(
+                        .send(SimulatedOrderCommand::Simulation(Arc::new(
                             sim_result.simulated_order.clone(),
-                        ))
+                        )))
                         .await
                         .is_err()
                 {
@@ -239,6 +253,10 @@ where
     /// feeding the sim tree.
     fn process_new_order(&mut self, order: Order) -> bool {
         self.orders_received.accumulate(&order);
+        if let Some(repl_key) = order.replacement_key() {
+            self.unique_replacement_key_bundles.insert(repl_key);
+            self.orders_with_replacement_key += 1;
+        }
         let order_id = order.id();
         if let Err(err) = self.sim_tree.push_orders(vec![order]) {
             error!(?err, "Failed to push order into the sim tree");
@@ -253,11 +271,12 @@ where
         for new_commnad in new_commands {
             match new_commnad {
                 OrderPoolCommand::Insert(order) => {
-                    if !self.process_new_order(order.clone()) {
-                        return false;
-                    }
+                    // This is not unrecoverable error, so if it fails, we ignore it and try processing next order
+                    let _success = self.process_new_order(order.clone());
                 }
                 OrderPoolCommand::Remove(order_id) => {
+                    // Returns false if channel is closed,
+                    // In that case there is no need to process any new orders or cancellations for this slot
                     if !self.process_order_cancellation(order_id).await {
                         return false;
                     }

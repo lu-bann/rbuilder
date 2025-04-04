@@ -1,24 +1,4 @@
 //! a2r prefix = alloy to reth conversion
-pub mod bls;
-pub mod build_info;
-pub mod constants;
-pub mod error_storage;
-pub mod fmt;
-mod noncer;
-mod provider_factory_reopen;
-pub mod reconnect;
-mod test_data_generator;
-mod tx_signer;
-
-pub mod provider_head_state;
-#[cfg(test)]
-pub mod test_utils;
-pub mod tracing;
-
-use alloy_network::Ethereum;
-use alloy_primitives::{Address, Sign, I256, U256};
-use alloy_provider::RootProvider;
-use alloy_transport::BoxTransport;
 
 use crate::primitives::{
     serialize::{RawTx, TxEncoding},
@@ -26,18 +6,42 @@ use crate::primitives::{
 };
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
-pub use noncer::{NonceCache, NonceCacheRef};
+use alloy_primitives::{Address, Sign, I256, U256};
+use alloy_provider::RootProvider;
+use reth_chainspec::ChainSpec;
+use reth_evm_ethereum::revm_spec_by_timestamp_and_block_number;
+use revm::context::CfgEnv;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+pub mod bls;
+pub mod build_info;
+pub mod constants;
+
+mod noncer;
+pub use noncer::NonceCache;
+
+pub mod error_storage;
+pub mod fmt;
+
+mod provider_factory_reopen;
 pub use provider_factory_reopen::{
     check_block_hash_reader_health, is_provider_factory_health_error, HistoricalBlockError,
     ProviderFactoryReopener, RootHasherImpl,
 };
-use reth_chainspec::ChainSpec;
-use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
-use revm_primitives::{CfgEnv, CfgEnvWithHandlerCfg};
-use std::cmp::{max, min};
+
+pub mod reconnect;
+
+mod test_data_generator;
 pub use test_data_generator::TestDataGenerator;
-use time::OffsetDateTime;
+
+mod tx_signer;
 pub use tx_signer::Signer;
+
+pub mod provider_head_state;
+pub mod tracing;
+
+#[cfg(test)]
+pub mod test_utils;
 
 /// de/serializes U256 as decimal value (U256 serde default is hexa). Needed to interact with some JSONs (eg:ProposerPayloadDelivered in relay provider API)
 pub mod u256decimal_serde_helper {
@@ -64,10 +68,8 @@ pub mod u256decimal_serde_helper {
     }
 }
 
-pub type BoxedProvider = RootProvider<BoxTransport, Ethereum>;
-
-pub fn http_provider(url: reqwest::Url) -> BoxedProvider {
-    RootProvider::new_http(url).boxed()
+pub fn http_provider(url: reqwest::Url) -> RootProvider {
+    RootProvider::new_http(url)
 }
 
 #[cfg(test)]
@@ -112,16 +114,11 @@ pub fn gen_uid() -> u64 {
     rand::random()
 }
 
-pub fn default_cfg_env(
-    chain: &ChainSpec,
-    block_timestamp_after_merge: u64,
-) -> CfgEnvWithHandlerCfg {
-    let mut cfg = CfgEnv::default();
-    cfg.chain_id = chain.chain().id();
-    CfgEnvWithHandlerCfg::new_with_spec_id(
-        cfg,
-        revm_spec_by_timestamp_after_merge(chain, block_timestamp_after_merge),
-    )
+pub fn default_cfg_env(chain_spec: &ChainSpec, block_timestamp: u64, block_number: u64) -> CfgEnv {
+    let spec = revm_spec_by_timestamp_and_block_number(chain_spec, block_timestamp, block_number);
+    CfgEnv::new()
+        .with_chain_id(chain_spec.chain().id())
+        .with_spec(spec)
 }
 
 pub fn unix_timestamp_now() -> u64 {
@@ -129,46 +126,6 @@ pub fn unix_timestamp_now() -> u64 {
         .unix_timestamp()
         .try_into()
         .unwrap_or_default()
-}
-
-pub fn calc_gas_limit(parent: u64, desired_limit: u64) -> u64 {
-    /* port of this fuction from geth builder
-    func CalcGasLimit(parentGasLimit, desiredLimit uint64) uint64 {
-        delta := parentGasLimit/params.GasLimitBoundDivisor - 1
-        limit := parentGasLimit
-        if desiredLimit < params.MinGasLimit {
-            desiredLimit = params.MinGasLimit
-        }
-        // If we're outside our allowed gas range, we try to hone towards them
-        if limit < desiredLimit {
-            limit = parentGasLimit + delta
-            if limit > desiredLimit {
-                limit = desiredLimit
-            }
-            return limit
-        }
-        if limit > desiredLimit {
-            limit = parentGasLimit - delta
-            if limit < desiredLimit {
-                limit = desiredLimit
-            }
-        }
-        return limit
-    }
-    */
-    let delta = parent / 1024 - 1;
-
-    let desired_limit = max(desired_limit, 5000);
-
-    if parent < desired_limit {
-        return min(parent + delta, desired_limit);
-    }
-
-    if parent > desired_limit {
-        return max(parent - delta, desired_limit);
-    }
-
-    parent
 }
 
 pub fn int_percentage(value: u64, percentage: usize) -> u64 {
@@ -244,9 +201,16 @@ pub fn extract_onchain_block_txs(
     Ok(result)
 }
 
+pub fn format_offset_datetime_rfc3339(datetime: &OffsetDateTime) -> String {
+    datetime
+        .format(&Rfc3339)
+        .expect("failed to format datetime")
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloy_eips::eip1559::calculate_block_gas_limit;
     use serde::{Deserialize, Serialize};
 
     #[test]
@@ -295,7 +259,7 @@ mod test {
         ];
 
         for test in tests {
-            let result = calc_gas_limit(test.parent, test.desired);
+            let result = calculate_block_gas_limit(test.parent, test.desired);
             assert_eq!(result, test.result);
         }
     }

@@ -5,6 +5,7 @@ use super::{
 use ahash::HashMap;
 use alloy_primitives::utils::format_ether;
 use reth::revm::cached::CachedReads;
+use reth_provider::StateProvider;
 use std::{sync::Arc, time::Instant};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
@@ -13,17 +14,19 @@ use tracing::{info_span, trace};
 use crate::{
     building::{
         builders::{
-            block_building_helper::{BlockBuildingHelper, BlockBuildingHelperFromProvider},
+            block_building_helper::{
+                BiddableUnfinishedBlock, BlockBuildingHelper, BlockBuildingHelperFromProvider,
+            },
             handle_building_error, UnfinishedBlockBuildingSink,
         },
         BlockBuildingContext,
     },
-    provider::StateProviderFactory,
+    telemetry::mark_builder_considers_order,
 };
 
 /// Assembles block building results from the best orderings of order groups.
-pub struct BlockBuildingResultAssembler<P> {
-    provider: P,
+pub struct BlockBuildingResultAssembler {
+    state: Arc<dyn StateProvider>,
     ctx: BlockBuildingContext,
     cancellation_token: CancellationToken,
     cached_reads: Option<CachedReads>,
@@ -37,10 +40,7 @@ pub struct BlockBuildingResultAssembler<P> {
     last_version: Option<u64>,
 }
 
-impl<P> BlockBuildingResultAssembler<P>
-where
-    P: StateProviderFactory + Clone + 'static,
-{
+impl BlockBuildingResultAssembler {
     /// Creates a new `BlockBuildingResultAssembler`.
     ///
     /// # Arguments
@@ -53,7 +53,7 @@ where
     pub fn new(
         config: &ParallelBuilderConfig,
         best_results: Arc<BestResults>,
-        provider: P,
+        state: Arc<dyn StateProvider>,
         ctx: BlockBuildingContext,
         cancellation_token: CancellationToken,
         builder_name: String,
@@ -61,7 +61,7 @@ where
         sink: Option<Arc<dyn UnfinishedBlockBuildingSink>>,
     ) -> Self {
         Self {
-            provider,
+            state,
             ctx,
             cancellation_token,
             cached_reads: None,
@@ -150,13 +150,15 @@ where
                     }
 
                     if let Some(sink) = &self.sink {
-                        sink.new_block(new_block);
+                        if let Ok(new_block) = BiddableUnfinishedBlock::new(new_block) {
+                            sink.new_block(new_block);
+                        }
                     }
                 }
             }
             Err(err) => {
                 let _span = info_span!("Parallel builder failed to build new block",run_id = self.run_id,version = version,err=?err).entered();
-                if !handle_building_error(err) {
+                if !handle_building_error(err, self.ctx.payload_id) {
                     return false;
                 }
             }
@@ -193,12 +195,11 @@ where
         }
 
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
-            self.provider.clone(),
+            self.state.clone(),
             ctx,
             self.cached_reads.clone(),
             self.builder_name.clone(),
             self.discard_txs,
-            None,
             self.cancellation_token.clone(),
         )?;
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
@@ -223,8 +224,13 @@ where
                 let (order_idx, _) = sequence_of_orders.sequence_of_orders.remove(0);
                 let sim_order = &order_group.orders[order_idx];
 
+                mark_builder_considers_order(
+                    sim_order.id(),
+                    &block_building_helper.built_block_trace().orders_closed_at,
+                    block_building_helper.builder_name(),
+                );
                 let start_time = Instant::now();
-                let commit_result = block_building_helper.commit_order(sim_order)?;
+                let commit_result = block_building_helper.commit_order(sim_order, &|_| Ok(()))?;
                 let order_commit_time = start_time.elapsed();
 
                 let mut gas_used = 0;
@@ -260,12 +266,11 @@ where
         orders_closed_at: OffsetDateTime,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
-            self.provider.clone(),
+            self.state.clone(),
             self.ctx.clone(),
             None, // No cached reads for backtest start
             String::from("backtest_builder"),
             self.discard_txs,
-            None,
             CancellationToken::new(),
         )?;
 
@@ -294,7 +299,7 @@ where
             for (order_idx, _) in sequence_of_orders.sequence_of_orders.iter() {
                 let sim_order = &order_group.orders[*order_idx];
 
-                let commit_result = block_building_helper.commit_order(sim_order)?;
+                let commit_result = block_building_helper.commit_order(sim_order, &|_| Ok(()))?;
 
                 match commit_result {
                     Ok(res) => {

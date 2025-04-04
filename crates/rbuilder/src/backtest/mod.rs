@@ -1,14 +1,14 @@
-mod backtest_build_block;
 mod backtest_build_range;
 pub mod execute;
 pub mod fetch;
 
+pub mod build_block;
 pub mod redistribute;
 pub mod restore_landed_orders;
 mod results_store;
 mod store;
 
-pub use backtest_build_block::run_backtest_build_block;
+use ahash::HashMap;
 pub use backtest_build_range::run_backtest_build_range;
 use std::collections::HashSet;
 
@@ -29,8 +29,9 @@ pub use results_store::{BacktestResultsStorage, StoredBacktestResult};
 use serde::{Deserialize, Serialize};
 pub use store::HistoricalDataStorage;
 use time::OffsetDateTime;
+use tracing::trace;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawOrdersWithTimestamp {
     pub timestamp_ms: u64,
     pub order: RawOrder,
@@ -71,6 +72,20 @@ pub struct BuiltBlockData {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderFilteredReason {
+    /// Order was received late
+    Timestamp,
+    /// Order was replaced
+    Replaced,
+    /// Order is made of mempool txs
+    MempoolTxs,
+    /// Order id was explicitly filtered out
+    Ids,
+    /// Order signer was explicitly filtered out
+    Signer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockData {
     pub block_number: u64,
     /// Extra info for landed block (not contained on onchain_block).
@@ -81,6 +96,7 @@ pub struct BlockData {
     /// Orders we had at the moment of building the block.
     /// This might be an approximation depending on DataSources used.
     pub available_orders: Vec<OrdersWithTimestamp>,
+    pub filtered_orders: HashMap<OrderId, OrderFilteredReason>,
     pub built_block_data: Option<BuiltBlockData>,
 }
 
@@ -97,20 +113,54 @@ impl BlockData {
     }
 
     fn filter_orders_by_end_timestamp_ms(&mut self, final_timestamp_ms: u64) {
-        self.available_orders
-            .retain(|orders| orders.timestamp_ms <= final_timestamp_ms);
+        // we never filter included orders even by timestamp
+        let included_orders: HashSet<_> = self
+            .built_block_data
+            .as_ref()
+            .map(|d| d.included_orders.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        self.available_orders.retain(|orders| {
+            let id = orders.order.id();
+            if included_orders.contains(&id) {
+                return true;
+            }
+            if orders.timestamp_ms <= final_timestamp_ms {
+                true
+            } else {
+                trace!(order = ?id, "order filtered by end timestamp");
+                self.filtered_orders
+                    .insert(id, OrderFilteredReason::Timestamp);
+                false
+            }
+        });
 
         // make sure that we have only one copy of the cancellable orders
         // we use timestamp and not replacement sequence number because of the limitation of the backtest
 
         // sort orders by timestamp from latest to earliest (high timestamp to low)
-        self.available_orders
-            .sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+        self.available_orders.sort_by(|a, b| {
+            b.timestamp_ms
+                .cmp(&a.timestamp_ms)
+                .then_with(|| a.order.id().cmp(&b.order.id()))
+        });
         let mut replacement_keys_seen: HashSet<OrderReplacementKey> = HashSet::default();
 
         self.available_orders.retain(|orders| {
             if let Some(key) = orders.order.replacement_key() {
-                if replacement_keys_seen.contains(&key) {
+                let id = orders.order.id();
+                let skip_order = if included_orders.contains(&id) {
+                    false
+                } else {
+                    replacement_keys_seen.contains(&key)
+                };
+
+                if skip_order {
+                    trace!(order = ?id, "order was replaced");
+                    self.filtered_orders
+                        .insert(id, OrderFilteredReason::Replaced);
                     return false;
                 }
                 replacement_keys_seen.insert(key);
@@ -135,13 +185,28 @@ impl BlockData {
                 return true;
             };
             let txs = orders.order.list_txs();
-            txs.iter().any(|(tx, _)| !mempool_txs.contains(&tx.hash()))
+            if txs.iter().any(|(tx, _)| !mempool_txs.contains(&tx.hash())) {
+                true
+            } else {
+                trace!(order = ?orders.order.id(), "order filtered from public mempool");
+                self.filtered_orders
+                    .insert(orders.order.id(), OrderFilteredReason::MempoolTxs);
+                false
+            }
         });
     }
 
     pub fn filter_orders_by_ids(&mut self, order_ids: &[String]) {
-        self.available_orders
-            .retain(|order| order_ids.contains(&order.order.id().to_string()));
+        self.available_orders.retain(|order| {
+            if order_ids.contains(&order.order.id().to_string()) {
+                true
+            } else {
+                trace!(order = ?order.order.id(), "order filtered by id");
+                self.filtered_orders
+                    .insert(order.order.id(), OrderFilteredReason::Ids);
+                false
+            }
+        });
     }
 
     pub fn filter_out_ignored_signers(&mut self, ignored_signers: &[Address]) {
@@ -152,7 +217,14 @@ impl BlockData {
             } else {
                 return true;
             };
-            !ignored_signers.contains(&signer)
+            if !ignored_signers.contains(&signer) {
+                true
+            } else {
+                trace!(order = ?order.id(), "order filtered by ignored signers");
+                self.filtered_orders
+                    .insert(order.id(), OrderFilteredReason::Signer);
+                false
+            }
         });
     }
 
@@ -175,7 +247,7 @@ impl BlockData {
         result
     }
 
-    /// Returns landed txs targeting account nonces non of our available txs were targeting.
+    /// Returns landed txs targeting account nonces none of our available txs were targeting.
     pub fn search_missing_account_nonce_on_available_orders(&self) -> Vec<(TxHash, AccountNonce)> {
         let mut available_accounts = HashSet::new();
         for order in self.available_orders.iter().map(|owt| &owt.order) {
@@ -186,16 +258,17 @@ impl BlockData {
         if let BlockTransactions::Full(txs) = &self.onchain_block.transactions {
             txs.iter()
                 .filter(|tx| {
+                    let tx = *tx;
                     !available_accounts
                         .iter()
-                        .any(|x| x.nonce == tx.nonce() && x.address == tx.from)
+                        .any(|x| x.nonce == tx.nonce() && x.address == tx.from())
                 })
                 .map(|tx| {
                     (
                         tx.tx_hash(),
                         AccountNonce {
                             nonce: tx.nonce(),
-                            account: tx.from,
+                            account: tx.from(),
                         },
                     )
                 })
@@ -206,7 +279,7 @@ impl BlockData {
     }
 
     fn is_validator_fee_payment(&self, tx: &Transaction) -> bool {
-        tx.from == self.onchain_block.header.beneficiary
+        tx.from() == self.onchain_block.header.beneficiary
             && TransactionTrait::to(tx)
                 .is_some_and(|to| to == self.winning_bid_trace.proposer_fee_recipient)
     }

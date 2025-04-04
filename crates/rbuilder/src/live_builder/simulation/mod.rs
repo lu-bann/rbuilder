@@ -9,7 +9,7 @@ use crate::{
     live_builder::order_input::orderpool::OrdersForBlock,
     primitives::{OrderId, SimulatedOrder},
     provider::StateProviderFactory,
-    utils::{gen_uid, Signer},
+    utils::{gen_uid, NonceCache, Signer},
 };
 use ahash::HashMap;
 use parking_lot::Mutex;
@@ -17,7 +17,7 @@ use simulation_job::SimulationJob;
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{info_span, Instrument};
+use tracing::{error, info_span, Instrument};
 
 #[derive(Debug)]
 pub struct SlotOrderSimResults {
@@ -61,7 +61,7 @@ pub struct OrderSimulationPool<P> {
 #[derive(Clone, Debug)]
 pub enum SimulatedOrderCommand {
     /// New simulation.
-    Simulation(SimulatedOrder),
+    Simulation(Arc<SimulatedOrder>),
     /// Forwarded cancellation from the order source.
     Cancellation(OrderId),
 }
@@ -111,7 +111,7 @@ where
             // use random coinbase for simulations to make top of the block simulation bypass harder
             let mut ctx = ctx;
             let signer = Signer::random();
-            ctx.block_env.coinbase = signer.address;
+            ctx.evm_env.block_env.beneficiary = signer.address;
             ctx.builder_signer = Some(signer);
             ctx
         };
@@ -119,11 +119,25 @@ where
         let provider = self.provider.clone();
         let current_contexts = Arc::clone(&self.current_contexts);
         let block_context: BlockContextId = gen_uid();
-        let span = info_span!("sim_ctx", block = ctx.block_env.number.to::<u64>(), parent = ?ctx.attributes.parent);
+        let span = info_span!("sim_ctx", block = ctx.evm_env.block_env.number, parent = ?ctx.attributes.parent);
 
         let handle = tokio::spawn(
             async move {
-                let sim_tree = SimTree::new(provider, ctx.attributes.parent);
+                let nonces = {
+                    let state = match provider.history_by_block_hash(ctx.attributes.parent) {
+                        Ok(state) => state,
+                        Err(err) => {
+                            error!(
+                                ?err,
+                                "Failed to get history_by_block_hash, cancelling simulation job"
+                            );
+                            return;
+                        }
+                    };
+                    NonceCache::new(state.into())
+                };
+
+                let sim_tree = SimTree::new(nonces);
                 let new_order_sub = input.new_order_sub;
                 let (sim_req_sender, sim_req_receiver) = flume::unbounded();
                 let (sim_results_sender, sim_results_receiver) = mpsc::channel(1024);

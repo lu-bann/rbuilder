@@ -31,12 +31,11 @@ async fn txpool_receive_util(count: u32) {
     let wallet = EthereumWallet::from(signer);
 
     let provider = ProviderBuilder::new()
-        .with_recommended_fillers()
         .wallet(wallet)
         .on_http(anvil.endpoint().parse().unwrap());
 
     let alice = anvil.addresses()[0];
-    let eip1559_est = provider.estimate_eip1559_fees(None).await.unwrap();
+    let eip1559_est = provider.estimate_eip1559_fees().await.unwrap();
 
     let tx = TransactionRequest::default()
         .with_to(alice)

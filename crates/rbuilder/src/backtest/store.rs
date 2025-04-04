@@ -21,6 +21,7 @@ use sqlx::{
     ConnectOptions, Connection, Executor, Row, SqliteConnection,
 };
 use std::{
+    default::Default,
     ffi::OsString,
     path::{Path, PathBuf},
     str::FromStr,
@@ -134,7 +135,7 @@ impl HistoricalDataStorage {
 
             CREATE TABLE IF NOT EXISTS built_block_included_orders (
                 block_number INTEGER NOT NULL,
-                order_id TEXT NOL NULL
+                order_id TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS built_block_data (
@@ -346,7 +347,7 @@ impl HistoricalDataStorage {
         .map(|mut v| v.remove(0))
     }
 
-    /// Retunrs BlockData for the given block, if some blocks are missing error is not returned.
+    /// Returns BlockData for the given block, if some blocks are missing error is not returned.
     /// WARN: will load into memory everything for blocks in range: min(blocks), max(blocks)
     pub async fn read_blocks(&mut self, blocks: &[u64]) -> eyre::Result<Vec<BlockData>> {
         let min_block = blocks.iter().min().copied().unwrap_or_default() as i64;
@@ -529,6 +530,7 @@ fn group_rows_into_block_data(
                     onchain_block,
                     available_orders: Vec::new(),
                     built_block_data: None,
+                    filtered_orders: Default::default(),
                 },
             ))
         })
@@ -612,11 +614,15 @@ mod test {
     use crate::{
         backtest::RawOrdersWithTimestamp,
         mev_boost::BuilderBlockReceived,
-        primitives::serialize::{RawBundle, RawTx},
+        primitives::{
+            serialize::{RawBundle, RawTx},
+            LAST_BUNDLE_VERSION,
+        },
     };
-    use alloy_consensus::TxEnvelope;
+    use alloy_consensus::{EthereumTxEnvelope, Signed, TxEip1559};
     use alloy_primitives::{hex, Address, PrimitiveSignature, B256, U256, U64};
     use alloy_rpc_types::{Block, BlockTransactions, Header, Transaction};
+    use reth_primitives::Recovered;
     use time::OffsetDateTime;
 
     #[tokio::test]
@@ -641,7 +647,7 @@ mod test {
             RawOrdersWithTimestamp {
                 timestamp_ms: 11,
                 order: RawOrder::Bundle(RawBundle {
-                    block_number: U64::from(12),
+                    block_number: Some(U64::from(12)),
                     txs: vec![tx.clone().into()],
                     reverting_tx_hashes: vec![],
                     replacement_uuid: Some(uuid::Uuid::from_u128(11)),
@@ -651,6 +657,13 @@ mod test {
                     min_timestamp: None,
                     max_timestamp: Some(100),
                     replacement_nonce: Some(0),
+                    dropping_tx_hashes: vec![],
+                    uuid: None,
+                    refund_percent: None,
+                    refund_recipient: None,
+                    refund_tx_hashes: None,
+                    first_seen_at: None,
+                    version: Some(RawBundle::encode_version(LAST_BUNDLE_VERSION)),
                 }),
             }
             .decode(TxEncoding::WithBlobData)
@@ -687,6 +700,7 @@ mod test {
             onchain_block,
             available_orders: orders,
             built_block_data: Some(built_block_data),
+            filtered_orders: Default::default(),
         };
 
         let mut storage = HistoricalDataStorage::new_from_memory().await.unwrap();
@@ -729,7 +743,7 @@ mod test {
     }
 
     fn create_test_tx() -> Transaction {
-        let inner_tx = alloy_consensus::TxEip1559 {
+        let inner_tx = TxEip1559 {
             chain_id: 1,
             nonce: 2,
             gas_limit: 3,
@@ -738,17 +752,19 @@ mod test {
             value: U256::from(6),
             ..Default::default()
         };
-        let tx = alloy_consensus::Signed::new_unchecked(
+        let tx = Signed::new_unchecked(
             inner_tx,
             PrimitiveSignature::test_signature(),
             B256::default(),
         );
         Transaction {
-            inner: TxEnvelope::from(tx),
+            inner: Recovered::new_unchecked(
+                EthereumTxEnvelope::from(tx),
+                Address::with_last_byte(6),
+            ),
             block_hash: Some(B256::with_last_byte(3)),
             block_number: Some(4),
             transaction_index: Some(5),
-            from: Address::with_last_byte(6),
             effective_gas_price: Some(7),
         }
     }

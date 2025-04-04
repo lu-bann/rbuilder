@@ -4,11 +4,13 @@ mod share_bundle_merger;
 
 #[cfg(test)]
 mod order_dumper;
+pub mod order_priority;
 #[cfg(test)]
 mod test_context;
 mod test_data_generator;
+use std::sync::Arc;
+
 use crate::{
-    building::Sorting,
     live_builder::simulation::SimulatedOrderCommand,
     primitives::{AccountNonce, OrderId, SimulatedOrder},
 };
@@ -16,15 +18,19 @@ use ahash::HashMap;
 use reth_errors::ProviderResult;
 use reth_provider::StateProviderBox;
 
+pub use order_priority::OrderPriority;
 pub use prioritized_order_store::PrioritizedOrderStore;
 pub use test_data_generator::TestDataGenerator;
 
 /// Generic SimulatedOrder sink to add and remove orders.
 pub trait SimulatedOrderSink {
-    fn insert_order(&mut self, order: SimulatedOrder);
+    fn insert_order(&mut self, order: Arc<SimulatedOrder>);
     /// if found, returns the removed order
-    fn remove_order(&mut self, id: OrderId) -> Option<SimulatedOrder>;
-    fn remove_orders(&mut self, orders: impl IntoIterator<Item = OrderId>) -> Vec<SimulatedOrder> {
+    fn remove_order(&mut self, id: OrderId) -> Option<Arc<SimulatedOrder>>;
+    fn remove_orders(
+        &mut self,
+        orders: impl IntoIterator<Item = OrderId>,
+    ) -> Vec<Arc<SimulatedOrder>> {
         let mut result = Vec::new();
         for id in orders {
             if let Some(o) = self.remove_order(id) {
@@ -51,10 +57,10 @@ pub fn simulated_order_command_to_sink<SinkType: SimulatedOrderSink>(
 /// SimulatedOrderSink that stores all orders + all the adds from last drain_new_orders ONLY if we didn't see removes.
 pub struct SimulatedOrderStore {
     /// Id -> order for all orders we manage. Carefully maintained by remove/insert
-    orders: HashMap<OrderId, SimulatedOrder>,
+    orders: HashMap<OrderId, Arc<SimulatedOrder>>,
     /// Stored add commands since last drain_new_orders. If we see a cancel y goes to None.
     /// This could be in another object..
-    new_orders: Option<Vec<SimulatedOrder>>,
+    new_orders: Option<Vec<Arc<SimulatedOrder>>>,
 }
 
 impl SimulatedOrderStore {
@@ -65,12 +71,12 @@ impl SimulatedOrderStore {
         }
     }
 
-    pub fn get_orders(&self) -> Vec<SimulatedOrder> {
+    pub fn get_orders(&self) -> Vec<Arc<SimulatedOrder>> {
         self.orders.values().cloned().collect()
     }
 
     /// Allows to get new adds ONLY if no remove_order was received
-    pub fn drain_new_orders(&mut self) -> Option<Vec<SimulatedOrder>> {
+    pub fn drain_new_orders(&mut self) -> Option<Vec<Arc<SimulatedOrder>>> {
         self.new_orders.replace(Vec::new())
     }
 }
@@ -82,30 +88,29 @@ impl Default for SimulatedOrderStore {
 }
 
 impl SimulatedOrderSink for SimulatedOrderStore {
-    fn insert_order(&mut self, order: SimulatedOrder) {
+    fn insert_order(&mut self, order: Arc<SimulatedOrder>) {
         if let Some(new_orders) = &mut self.new_orders {
             new_orders.push(order.clone());
         }
         self.orders.insert(order.id(), order);
     }
 
-    fn remove_order(&mut self, id: OrderId) -> Option<SimulatedOrder> {
+    fn remove_order(&mut self, id: OrderId) -> Option<Arc<SimulatedOrder>> {
         self.new_orders = None;
         self.orders.remove(&id)
     }
 }
 
 /// Create block orders struct from simulated orders. Used in the backtest, not practical while live.
-pub fn block_orders_from_sim_orders(
-    sim_orders: &[SimulatedOrder],
-    sorting: Sorting,
+pub fn block_orders_from_sim_orders<OrderPriorityType: OrderPriority>(
+    sim_orders: &[Arc<SimulatedOrder>],
     state_provider: &StateProviderBox,
-) -> ProviderResult<PrioritizedOrderStore> {
+) -> ProviderResult<PrioritizedOrderStore<OrderPriorityType>> {
     let mut onchain_nonces = vec![];
     for order in sim_orders {
         for nonce in order.order.nonces() {
             let value = state_provider
-                .account_nonce(nonce.address)?
+                .account_nonce(&nonce.address)?
                 .unwrap_or_default();
             onchain_nonces.push(AccountNonce {
                 account: nonce.address,
@@ -113,7 +118,7 @@ pub fn block_orders_from_sim_orders(
             });
         }
     }
-    let mut block_orders = PrioritizedOrderStore::new(sorting, onchain_nonces);
+    let mut block_orders = PrioritizedOrderStore::<OrderPriorityType>::new(onchain_nonces);
 
     for order in sim_orders.iter().cloned() {
         block_orders.insert_order(order);
@@ -126,24 +131,24 @@ pub fn block_orders_from_sim_orders(
 mod test {
     use crate::primitives::BundledTxInfo;
 
-    use super::*;
+    use super::{order_priority::OrderMaxProfitPriority, *};
     /// Helper struct for common PrioritizedOrderStore test operations
     /// Works hardcoded on Sorting::MaxProfit since it changes nothing on internal logic
     struct TestContext {
         pub data_gen: TestDataGenerator,
-        pub order_pool: PrioritizedOrderStore,
+        pub order_pool: PrioritizedOrderStore<OrderMaxProfitPriority>,
     }
 
     impl TestContext {
         /// Context with 1 account to send txs from
-        pub fn new_1_account(nonce: u64) -> (AccountNonce, TestContext) {
+        pub fn new_1_account(nonce: u64) -> (AccountNonce, Self) {
             let mut data_gen = TestDataGenerator::default();
             let nonce = data_gen.create_account_nonce(nonce);
             (
                 nonce.clone(),
                 TestContext {
                     data_gen,
-                    order_pool: PrioritizedOrderStore::new(Sorting::MaxProfit, vec![nonce]),
+                    order_pool: PrioritizedOrderStore::<OrderMaxProfitPriority>::new(vec![nonce]),
                 },
             )
         }
@@ -161,10 +166,9 @@ mod test {
                 nonce_2.clone(),
                 TestContext {
                     data_gen,
-                    order_pool: PrioritizedOrderStore::new(
-                        Sorting::MaxProfit,
-                        vec![nonce_1, nonce_2],
-                    ),
+                    order_pool: PrioritizedOrderStore::<OrderMaxProfitPriority>::new(vec![
+                        nonce_1, nonce_2,
+                    ]),
                 },
             )
         }
@@ -174,7 +178,7 @@ mod test {
             &mut self,
             tx_nonce: &AccountNonce,
             tx_profit: u64,
-        ) -> SimulatedOrder {
+        ) -> Arc<SimulatedOrder> {
             let order = self.data_gen.base.create_tx_order(tx_nonce.clone());
             let order = self.data_gen.create_sim_order(order, tx_profit, tx_profit);
             self.order_pool.insert_order(order.clone());
@@ -186,7 +190,7 @@ mod test {
             &mut self,
             txs_info: &[BundledTxInfo],
             bundle_profit: u64,
-        ) -> SimulatedOrder {
+        ) -> Arc<SimulatedOrder> {
             let order = self.data_gen.base.create_bundle_multi_tx_order(
                 0, // in the context of PrioritizedOrderStore we don't care about the block (it's prefiltered)
                 txs_info, None,
@@ -206,7 +210,7 @@ mod test {
             tx2_nonce: &AccountNonce,
             tx2_optional: bool,
             bundle_profit: u64,
-        ) -> SimulatedOrder {
+        ) -> Arc<SimulatedOrder> {
             let txs_info = [
                 BundledTxInfo {
                     nonce: tx1_nonce.clone(),

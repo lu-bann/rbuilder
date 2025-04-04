@@ -1,13 +1,11 @@
-use alloy_primitives::Address;
-use reth_primitives::{transaction::FillTxEnv, TransactionSignedEcRecovered};
-use revm::{inspector_handle_register, primitives::Env};
-use revm_primitives::TxEnv;
-
 use crate::building::{
     evm_inspector::{RBuilderEVMInspector, UsedStateTrace},
     testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TestContracts, TxArgs},
     BlockState,
 };
+use alloy_primitives::Address;
+use reth_evm::{Evm, EvmFactory};
+use reth_primitives::{Recovered, TransactionSigned};
 
 #[derive(Debug)]
 pub struct TestSetup {
@@ -34,7 +32,7 @@ impl TestSetup {
         from: NamedAddr,
         to: NamedAddr,
         value: u64,
-    ) -> eyre::Result<TransactionSignedEcRecovered> {
+    ) -> eyre::Result<Recovered<TransactionSigned>> {
         let tx_args = TxArgs::new(from, 0).to(to).value(value);
         let tx = self.test_chain.sign_tx(tx_args)?;
         Ok(tx)
@@ -44,13 +42,13 @@ impl TestSetup {
         &self,
         slot: u64,
         current_value: u64,
-    ) -> eyre::Result<TransactionSignedEcRecovered> {
+    ) -> eyre::Result<Recovered<TransactionSigned>> {
         let tx_args = TxArgs::new_increment_value(NamedAddr::User(0), 0, slot, current_value);
         let tx = self.test_chain.sign_tx(tx_args)?;
         Ok(tx)
     }
 
-    pub fn make_deploy_mev_test_tx(&self) -> eyre::Result<TransactionSignedEcRecovered> {
+    pub fn make_deploy_mev_test_tx(&self) -> eyre::Result<Recovered<TransactionSigned>> {
         let mev_test_init_bytecode = TestContracts::load().mev_test_init_bytecode;
         let tx_args = TxArgs::new(NamedAddr::User(0), 0).input(mev_test_init_bytecode.into());
         let tx = self.test_chain.sign_tx(tx_args)?;
@@ -61,7 +59,7 @@ impl TestSetup {
         &self,
         read_balance_addr: Address,
         value: u64,
-    ) -> eyre::Result<TransactionSignedEcRecovered> {
+    ) -> eyre::Result<Recovered<TransactionSigned>> {
         let tx_args =
             TxArgs::new_test_read_balance(NamedAddr::User(0), 0, read_balance_addr, value);
         let tx = self.test_chain.sign_tx(tx_args)?;
@@ -72,7 +70,7 @@ impl TestSetup {
         &self,
         refund_addr: Address,
         value: u64,
-    ) -> eyre::Result<TransactionSignedEcRecovered> {
+    ) -> eyre::Result<Recovered<TransactionSigned>> {
         let tx_args =
             TxArgs::new_test_ephemeral_contract_destruct(NamedAddr::User(0), 0, refund_addr)
                 .value(value);
@@ -82,7 +80,7 @@ impl TestSetup {
 
     pub fn inspect_tx_without_commit(
         &self,
-        tx: TransactionSignedEcRecovered,
+        tx: Recovered<TransactionSigned>,
     ) -> eyre::Result<UsedStateTrace> {
         let mut used_state_trace = UsedStateTrace::default();
         let mut inspector = RBuilderEVMInspector::new(&tx, Some(&mut used_state_trace));
@@ -94,25 +92,13 @@ impl TestSetup {
 
         // execute transaction
         {
-            let mut tx_env = TxEnv::default();
-            tx.as_ref().fill_tx_env(&mut tx_env, tx.signer());
-            let mut evm = revm::Evm::builder()
-                .with_spec_id(self.test_chain.block_building_context().spec_id)
-                .with_env(Box::new(Env {
-                    cfg: self
-                        .test_chain
-                        .block_building_context()
-                        .initialized_cfg
-                        .cfg_env
-                        .clone(),
-                    block: self.test_chain.block_building_context().block_env.clone(),
-                    tx: tx_env,
-                }))
-                .with_external_context(&mut inspector)
-                .with_db(db_ref.as_mut())
-                .append_handler_register(inspector_handle_register)
-                .build();
-            evm.transact()
+            let ctx = self.test_chain.block_building_context();
+            let mut evm = ctx.evm_factory.create_evm_with_inspector(
+                db_ref.as_mut(),
+                ctx.evm_env.clone(),
+                &mut inspector,
+            );
+            evm.transact(&tx)
                 .map_err(|e| eyre::eyre!("execution failure: {:?}", e))?;
         }
 
