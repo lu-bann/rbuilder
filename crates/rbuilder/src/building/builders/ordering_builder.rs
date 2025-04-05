@@ -334,13 +334,13 @@ impl OrderingBuilderContext {
         )?;
 
         // fill constraints
-        let constraints = self.fill_constraints(
+        self.fill_constraints(
             &mut block_building_helper,
-            slot_constraints,
+            slot_constraints.clone(),
             block_orders.clone(),
             build_start,
         )?;
-        block_building_helper.set_constraints(constraints);
+        block_building_helper.set_constraints(slot_constraints);
 
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
@@ -354,8 +354,7 @@ impl OrderingBuilderContext {
         slot_constraints: Vec<SignedConstraints>,
         mut block_orders: PrioritizedOrderStore<OrderPriorityType>,
         build_start: Instant,
-    ) -> eyre::Result<Vec<TransactionSignedEcRecoveredWithBlobs>> {
-        let mut result = Vec::new();
+    ) -> eyre::Result<()> {
         for constraint in slot_constraints {
             let transactions = constraint.message.transactions.to_vec();
             for tx in transactions {
@@ -405,11 +404,10 @@ impl OrderingBuilderContext {
                     ?execution_error,
                     "Executed order"
                 );
-                result.push(tx);
             }
         }
 
-        Ok(result)
+        Ok(())
     }
 
     fn fill_orders<OrderPriorityType: OrderPriority>(

@@ -17,7 +17,7 @@ use crate::{
         EstimatePayoutGasErr, ExecutionError, ExecutionResult, FinalizeError, FinalizeResult,
         PartialBlock,
     },
-    primitives::{SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
+    primitives::{constraints::SignedConstraints, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
     telemetry::{self, add_block_fill_time, add_order_simulation_time},
     utils::{check_block_hash_reader_health, HistoricalBlockError},
 };
@@ -48,7 +48,7 @@ pub trait BlockBuildingHelper: Send + Sync {
         constraint: &TransactionSignedEcRecoveredWithBlobs,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError>;
 
-    fn set_constraints(&mut self, constraints: Vec<TransactionSignedEcRecoveredWithBlobs>);
+    fn set_constraints(&mut self, constraints: Vec<SignedConstraints>);
 
     /// Call set the trace fill_time (we still have to review this)
     fn set_trace_fill_time(&mut self, time: Duration);
@@ -402,7 +402,7 @@ impl BlockBuildingHelper for BlockBuildingHelperFromProvider {
         }
     }
 
-    fn set_constraints(&mut self, constraints: Vec<TransactionSignedEcRecoveredWithBlobs>) {
+    fn set_constraints(&mut self, constraints: Vec<SignedConstraints>) {
         self.built_block_trace.slot_constraints = Some(constraints);
     }
 

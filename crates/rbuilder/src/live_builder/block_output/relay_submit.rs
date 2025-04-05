@@ -8,7 +8,7 @@ use crate::{
     },
     primitives::{
         mev_boost::{MevBoostRelayBidSubmitter, MevBoostRelayID},
-        proofs::calculate_merkle_multi_proofs,
+        proofs::generate_inclusion_proofs,
     },
     telemetry::{
         add_relay_submit_time, add_subsidy_value, inc_conn_relay_errors,
@@ -23,7 +23,6 @@ use alloy_primitives::{utils::format_ether, U256};
 use mockall::automock;
 use parking_lot::Mutex;
 use reth_chainspec::ChainSpec;
-use reth_primitives::TransactionSigned;
 use std::sync::Arc;
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -184,19 +183,15 @@ async fn run_submit_to_relays_job(
 
         // generate inclusion proofs for constraints if present for the slot
         let inclusion_proofs = match &block.trace.slot_constraints {
-            Some(constraints) => {
+            Some(slot_constraints) => {
                 let payload_transactions = block.sealed_block.body().transactions.clone();
-                let slot_constraints: Vec<TransactionSigned> = constraints
-                    .iter()
-                    .map(|tx| tx.clone().into_internal_tx_unsecure().inner().clone())
-                    .collect::<Vec<TransactionSigned>>();
 
                 debug!(
                     "Calculating inclusion proofs for slot: {:?}",
                     slot_constraints
                 );
-
-                Some(calculate_merkle_multi_proofs(payload_transactions, slot_constraints).unwrap())
+                None
+                // Some(generate_inclusion_proofs(payload_transactions, slot_constraints, false).unwrap())
             }
             None => None,
         };

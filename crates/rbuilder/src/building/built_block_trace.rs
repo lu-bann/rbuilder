@@ -1,8 +1,5 @@
 use super::{BundleErr, ExecutionError, ExecutionResult, OrderErr};
-use crate::primitives::{
-    Order, OrderId, OrderReplacementKey,
-    TransactionSignedEcRecoveredWithBlobs,
-};
+use crate::primitives::{constraints::SignedConstraints, Order, OrderId, OrderReplacementKey};
 use ahash::{AHasher, HashMap, HashSet};
 use alloy_primitives::{Address, TxHash, U256};
 use std::{collections::hash_map, hash::Hasher, time::Duration};
@@ -15,7 +12,7 @@ use time::OffsetDateTime;
 pub struct BuiltBlockTrace {
     pub included_orders: Vec<ExecutionResult>,
     /// slot_constraints if present
-    pub slot_constraints: Option<Vec<TransactionSignedEcRecoveredWithBlobs>>,
+    pub slot_constraints: Option<Vec<SignedConstraints>>,
     /// How much we bid (pay to the validator)
     pub bid_value: U256,
     /// coinbase balance delta before the payout tx.

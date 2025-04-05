@@ -9,19 +9,20 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
 
-#[derive(Debug, Clone, Serializable, serde::Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Serializable, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct SignedConstraints {
     pub message: ConstraintsMessage,
     pub signature: BlsSignature,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Serializable, PartialEq)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Serializable, PartialEq, Eq)]
 pub struct ConstraintsMessage {
     pub pubkey: BlsPublicKey,
     pub slot: u64,
     pub top: bool,
     pub transactions: List<Transaction, MAX_CONSTRAINTS_PER_SLOT>,
 }
+
 
 impl ConstraintsMessage {
     #[allow(dead_code)]

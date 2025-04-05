@@ -1,18 +1,18 @@
-use crate::live_builder::simulation::SimulatedOrderCommand;
-use crate::primitives::SimValue;
-use crate::provider::RootHasher;
-use crate::roothash::RootHashError;
 use crate::{
     building::{
         BlockBuildingContext, BuiltBlockTrace, CriticalCommitOrderError, ExecutionError,
         ExecutionResult,
     },
-    primitives::{SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
+    live_builder::simulation::SimulatedOrderCommand,
+    primitives::{
+        constraints::SignedConstraints, SimValue, SimulatedOrder,
+        TransactionSignedEcRecoveredWithBlobs,
+    },
+    provider::RootHasher,
+    roothash::RootHashError,
 };
-use alloy_primitives::B256;
-use alloy_primitives::U256;
-use reth::providers::ExecutionOutcome;
-use reth::revm::cached::CachedReads;
+use alloy_primitives::{B256, U256};
+use reth::{providers::ExecutionOutcome, revm::cached::CachedReads};
 use reth_primitives::SealedBlock;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
@@ -72,7 +72,7 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
         unimplemented!()
     }
 
-    fn set_constraints(&mut self, _constraints: Vec<TransactionSignedEcRecoveredWithBlobs>) {
+    fn set_constraints(&mut self, _constraints: Vec<SignedConstraints>) {
         unimplemented!()
     }
 

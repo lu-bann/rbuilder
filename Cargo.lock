@@ -4457,6 +4457,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashtree-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "581dba7aacbf2c203c72f3d977f8b46bf83491a58bf908a335c7efc5d0604f74"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "hdrhistogram"
 version = "7.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8721,6 +8731,7 @@ dependencies = [
  "toml 0.8.20",
  "tracing",
  "tracing-subscriber",
+ "tree_hash",
  "url",
  "uuid",
  "warp",
@@ -12855,6 +12866,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest 0.10.7",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -13382,6 +13403,7 @@ source = "git+https://github.com/lu-bann/ssz-rs.git?branch=ft%2Fproofs#00120b998
 dependencies = [
  "alloy-primitives",
  "bitvec",
+ "hashtree-rs",
  "lazy_static",
  "once_cell",
  "rayon",
