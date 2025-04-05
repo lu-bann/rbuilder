@@ -38,19 +38,10 @@ impl TryFrom<SignedConstraints> for SignedConstraintsWithProofData {
 
             // Compute the hash tree root on the transaction object decoded without the optional
             // sidecar. this is to prevent hashing the blobs of type 3 transactions.
-            let mut root = Vec::new();
-            tx.encode(&mut root);
-            let root = Transaction::try_from(root.as_ref())
-                .map_err(|e| ProofError::DecodingFailed(e.to_string()))?;
-            let root = root
+            let root = transaction
                 .hash_tree_root()
                 .map_err(|e| ProofError::DecodingFailed(e.to_string()))?;
             let root = Hash256::from_slice(root.as_slice());
-
-            // let root = transaction
-            //     .hash_tree_root()
-            //     .map_err(|e| ProofError::DecodingFailed(e.to_string()))?;
-            // let root = Hash256::from_slice(root.as_slice());
 
             transactions.push((tx_hash, root));
         }
