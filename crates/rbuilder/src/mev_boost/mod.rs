@@ -4,8 +4,6 @@ pub mod rpc;
 pub mod sign_payload;
 pub mod submission;
 
-use crate::primitives::proofs::InclusionProofs;
-
 use super::utils::u256decimal_serde_helper;
 
 use alloy_primitives::{Address, BlockHash, Bytes, U256};
@@ -490,11 +488,12 @@ impl RelayClient {
                 match &submission_with_metadata.submission {
                     SubmitBlockRequest::Capella(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::Deneb(data) => data.0.as_ssz_bytes(),
-                    SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::DenebWithProofs(data) => {
                         url.set_path("/relay/v1/builder/blocks_with_proofs");
                         data.0.inner.as_ssz_bytes()
                     }
+                    SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
+
                 },
                 SSZ_CONTENT_TYPE,
             )

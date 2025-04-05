@@ -1634,7 +1634,7 @@ checksum = "89e25b6adfb930f02d1981565a6e5d9c547ac15a96606256d3b59040e5cd4ca3"
 [[package]]
 name = "beacon-api-client"
 version = "0.1.0"
-source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=multi-proofs#11a3b9000a5eb90e5c8d0713a51e75aa85559c0d"
+source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=ft%2Fproofs#2192a6e9a946c0b4ec63efda321e7115a499bf5e"
 dependencies = [
  "clap 4.5.35",
  "ethereum-consensus",
@@ -3614,7 +3614,7 @@ dependencies = [
 [[package]]
 name = "ethereum-consensus"
 version = "0.1.1"
-source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=multi-proofs#11a3b9000a5eb90e5c8d0713a51e75aa85559c0d"
+source = "git+https://github.com/lu-bann/ethereum-consensus/?branch=ft%2Fproofs#2192a6e9a946c0b4ec63efda321e7115a499bf5e"
 dependencies = [
  "blst",
  "bs58 0.4.0",
@@ -13378,19 +13378,22 @@ dependencies = [
 [[package]]
 name = "ssz_rs"
 version = "0.9.0"
-source = "git+https://github.com/lu-bann/ssz-rs.git?branch=multi_proofs#868112226f48cef5566f913417a5069744415d58"
+source = "git+https://github.com/lu-bann/ssz-rs.git?branch=ft%2Fproofs#00120b998b0feb0fef9891ea35908fe63a3335a5"
 dependencies = [
  "alloy-primitives",
  "bitvec",
+ "lazy_static",
+ "once_cell",
+ "rayon",
  "serde",
- "sha2 0.9.9",
+ "sha2 0.10.8",
  "ssz_rs_derive",
 ]
 
 [[package]]
 name = "ssz_rs_derive"
 version = "0.9.0"
-source = "git+https://github.com/lu-bann/ssz-rs.git?branch=multi_proofs#868112226f48cef5566f913417a5069744415d58"
+source = "git+https://github.com/lu-bann/ssz-rs.git?branch=ft%2Fproofs#00120b998b0feb0fef9891ea35908fe63a3335a5"
 dependencies = [
  "proc-macro2",
  "quote",

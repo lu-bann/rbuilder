@@ -19,12 +19,11 @@ use crate::{
     utils::error_storage::store_error_event,
 };
 use ahash::HashMap;
-use alloy_consensus::SignableTransaction;
 use alloy_primitives::{utils::format_ether, U256};
 use mockall::automock;
 use parking_lot::Mutex;
 use reth_chainspec::ChainSpec;
-use reth_primitives::{SealedBlock, TransactionSigned};
+use reth_primitives::TransactionSigned;
 use std::sync::Arc;
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -187,16 +186,16 @@ async fn run_submit_to_relays_job(
         let inclusion_proofs = match &block.trace.slot_constraints {
             Some(constraints) => {
                 let payload_transactions = block.sealed_block.body().transactions.clone();
-                let slot_constraints: Vec<TransactionSigned> =
-                 // constraints
-                //     .iter()
-                //     .map(|tx| tx.clone().into_internal_tx_unsecure().into_signed())
-                //     .collect();
-                Vec::new();
+                let slot_constraints: Vec<TransactionSigned> = constraints
+                    .iter()
+                    .map(|tx| tx.clone().into_internal_tx_unsecure().inner().clone())
+                    .collect::<Vec<TransactionSigned>>();
+
                 debug!(
                     "Calculating inclusion proofs for slot: {:?}",
                     slot_constraints
                 );
+
                 Some(calculate_merkle_multi_proofs(payload_transactions, slot_constraints).unwrap())
             }
             None => None,

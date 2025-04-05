@@ -20,8 +20,9 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
-    primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
-    primitives::constraints::SignedConstraints,
+    primitives::{
+        constraints::SignedConstraints, MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs,
+    },
     provider::StateProviderFactory,
     telemetry::{inc_active_slots, mark_building_started, reset_histogram_metrics},
     utils::{
@@ -29,7 +30,7 @@ use crate::{
         provider_head_state::ProviderHeadState, Signer,
     },
 };
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use block_list_provider::BlockListProvider;

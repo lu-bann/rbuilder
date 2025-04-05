@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::future::Future;
 use std::path::Path;
 use std::{
