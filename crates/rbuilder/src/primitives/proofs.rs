@@ -1,6 +1,5 @@
 use super::constraints::SignedConstraints;
 use alloy_consensus::TxEnvelope;
-use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{TxHash, B256};
 use alloy_rlp::{Decodable, Encodable};
 use ethereum_consensus::{
@@ -80,6 +79,8 @@ pub enum ProofError {
     VerificationFailed,
     #[error("Decoding failed: {0}")]
     DecodingFailed(String),
+    #[error("Failed to generate proof")]
+    FailedToGenerateProof,
 }
 
 /// InclusionProof is a Merkle Multiproof of inclusion of a set of TransactionHashes
@@ -116,7 +117,7 @@ fn constraints_to_signed_txs(constraints: &Vec<SignedConstraints>) -> Vec<Transa
 }
 
 pub fn generate_inclusion_proofs(
-    payload_transactions: Vec<TxEnvelope>,
+    payload_transactions: Vec<TransactionSigned>,
     constraints: &Vec<SignedConstraints>,
     verify_proof: bool,
 ) -> Result<InclusionProofs, ProofError> {
@@ -158,22 +159,18 @@ pub fn generate_inclusion_proofs(
         .collect();
     let paths: Vec<&[PathElement]> = indices.iter().map(|p| &p[..]).collect();
 
-    let result = ssz_txs.multi_prove(&paths);
-    // println!("MultiProof result: {:?}", result);
-    let (multi_proof, witness) = result.unwrap();
-
+    let (multi_proof, witness) = ssz_txs
+        .multi_prove(&paths)
+        .map_err(|_| ProofError::FailedToGenerateProof)?;
     assert_eq!(root, witness);
-    let multi_proof_verify_result = ssz_rs::multiproofs::verify_merkle_multiproof(
+
+    ssz_rs::multiproofs::verify_merkle_multiproof(
         &multi_proof.leaves,
         &multi_proof.branch,
         &multi_proof.indices,
         root,
-    );
-    // println!("MultiProof verify result: {:?}", multi_proof_verify_result);
-    assert!(multi_proof_verify_result.is_ok());
-    println!(" multi proof leaves: {:?}", &multi_proof.leaves);
-    // println!(" multi proof branch: {:?}", &multi_proof.branch);
-    // println!(" multi proof indices: {:?}", &multi_proof.indices);
+    )
+    .map_err(|_| ProofError::VerificationFailed)?;
 
     let inclusion_proof = create_inclusion_proof_from_multi_proof(multi_proof, constraint_txs)?;
 
@@ -191,7 +188,6 @@ pub fn generate_inclusion_proofs(
             .iter()
             .map(|proof_data| &proof_data.proof_data)
             .collect();
-        println!("Constraints proofs data: {:?}", constraints_proofs_data);
         verify_inclusion_proofs(&constraints_proofs_data, &inclusion_proof, root)?;
     }
 
@@ -275,21 +271,18 @@ pub fn verify_inclusion_proofs(
         .into_iter()
         .map(|h| h.as_slice().try_into().unwrap())
         .collect::<Vec<_>>();
-    println!("Leaves: {:?}", leaves.as_slice());
     let merkle_proofs = proofs
         .merkle_hashes
         .to_vec()
         .iter()
         .map(|h| h.as_slice().try_into().unwrap())
         .collect::<Vec<_>>();
-    // println!("Merkle proofs: {:?}", merkle_proofs.as_slice());
     let indexes = proofs
         .generalized_indexes
         .to_vec()
         .iter()
         .map(|h| *h as usize)
         .collect::<Vec<_>>();
-    println!("Indexes: {:?}", indexes.as_slice());
     let root = root.as_slice().try_into().expect("Invalid root length");
 
     // Verify the Merkle multiproof against the root
@@ -306,10 +299,11 @@ pub fn verify_inclusion_proofs(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use crate::primitives::constraints::ConstraintsMessage;
 
     use super::*;
-    use alloy_eips::{Decodable2718, Encodable2718};
     use alloy_primitives::hex;
     use ethereum_consensus::primitives::{BlsPublicKey, BlsSignature};
 
@@ -327,21 +321,17 @@ mod tests {
         "0x02f90175018203e68502f2984500851d1963750083047d5c947a250d5630b4cf539739df2c5dacb4c659f2488d80b90104791ac947000000000000000000000000000000000000000000000056bc75e2d63100000000000000000000000000000000000000000000000000000004d530a8c31f46cb00000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000ce155b2c051fd1f75313d5e3db14e7763e7f7e7700000000000000000000000000000000000000000000000000000000674dd38900000000000000000000000000000000000000000000000000000000000000020000000000000000000000001a3a8cf347b2bf5890d3d6a1b981c4f4432c8661000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2c001a017d06907cdfb8bba1abdc24d385efce6cfb6e4af9657486656fd242987f4c58da07f4ac6c44d52340e8061c9f1479e7547e73a838f4ff048ad4c333e32b9176259",
         ];
 
-        let payload_txs: Vec<TxEnvelope> = test_data
+        let start = Instant::now();
+
+        let payload_txs: Vec<TransactionSigned> = test_data
             .into_iter()
             .map(|tx_hex| {
                 let tx_trimmed = tx_hex.strip_prefix("0x").unwrap_or(tx_hex);
                 let raw_tx = hex::decode(tx_trimmed).expect("Failed to decode hex");
                 let tx = TxEnvelope::decode(&mut raw_tx.as_slice()).unwrap();
-                println!("tx: {:?}", tx.hash());
-                let tx_list = List::<u8, MAX_BYTES_PER_TRANSACTION>::try_from(raw_tx).unwrap();
-                let root = tx_list.hash_tree_root().unwrap();
-                println!("{:?}", root);
-                tx
+                TransactionSigned::from(tx)
             })
             .collect();
-
-        println!("Payload transactions: {:?}", payload_txs.len());
 
         let txs = vec![
             payload_txs[4].clone(),
@@ -356,10 +346,6 @@ mod tests {
             let tx_ref: &[u8] = tx_encoded.as_ref();
             let tx_bytes: ByteList<MAX_BYTES_PER_TRANSACTION> =
                 tx_ref.try_into().expect("tx bytes too big");
-            let hash_tree_root = tx_bytes.hash_tree_root().unwrap();
-            println!("tx hash tree root: {:?}", hash_tree_root);
-            let root = Hash256::from_slice(hash_tree_root.as_slice());
-            println!("tx hash tree root . 0: {:?}", B256::from(root.0));
             constraints.push(tx_bytes);
         }
 
@@ -376,7 +362,11 @@ mod tests {
 
         let inclusion_proof =
             generate_inclusion_proofs(payload_txs.clone(), &vec![signed_constraints], true);
-        println!("{:?}", inclusion_proof);
         assert!(inclusion_proof.is_ok());
+
+        println!(
+            "Inclusion proof generated in {:?}ms",
+            start.elapsed().as_millis()
+        );
     }
 }

@@ -190,8 +190,11 @@ async fn run_submit_to_relays_job(
                     "Calculating inclusion proofs for slot: {:?}",
                     slot_constraints
                 );
-                None
-                // Some(generate_inclusion_proofs(payload_transactions, slot_constraints, false).unwrap())
+
+                Some(
+                    generate_inclusion_proofs(payload_transactions, slot_constraints, false)
+                        .unwrap(),
+                )
             }
             None => None,
         };
