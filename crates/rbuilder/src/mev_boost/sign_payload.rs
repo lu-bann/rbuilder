@@ -1,15 +1,15 @@
 use super::submission::{
     CapellaSubmitBlockRequest, DenebSubmitBlockRequest, DenebSubmitBlockWithProofsRequest,
-    ElectraSubmitBlockRequest, SignedBidSubmissionV3WithProofs, SubmitBlockRequest,
+    ElectraSubmitBlockRequest, ElectraSubmitBlockRequestWithProofs,
+    SignedBidSubmissionV3WithProofs, SignedBidSubmissionV4WithProofs, SubmitBlockRequest,
 };
 use crate::{primitives::proofs::InclusionProofs, utils::u256decimal_serde_helper};
-use alloy_eips::eip7685::Requests;
-use alloy_eips::{eip2718::Encodable2718, eip4844::BlobTransactionSidecar};
+use alloy_eips::{eip2718::Encodable2718, eip4844::BlobTransactionSidecar, eip7685::Requests};
 use alloy_primitives::{Address, BlockHash, Bytes, FixedBytes, B256, U256};
-use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_beacon::{
     events::PayloadAttributesData,
     relay::{BidTrace, SignedBidSubmissionV2, SignedBidSubmissionV3, SignedBidSubmissionV4},
+    requests::ExecutionRequestsV4,
     BlsPublicKey,
 };
 use alloy_rpc_types_engine::{
@@ -201,32 +201,42 @@ pub fn sign_block_for_relay(
         let execution_requests =
             ExecutionRequestsV4::try_from(Requests::new(execution_requests.to_vec()))?;
         if chain_spec.is_prague_active_at_timestamp(sealed_block.timestamp) {
-            SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(SignedBidSubmissionV4 {
+            let inner = SignedBidSubmissionV4 {
                 message,
                 execution_payload,
                 blobs_bundle,
                 signature,
                 execution_requests,
-            }))
-        } else if inclusion_proofs.is_none() {
-            SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(SignedBidSubmissionV3 {
+            };
+
+            if inclusion_proofs.is_some() {
+                SubmitBlockRequest::ElectraWithProofs(ElectraSubmitBlockRequestWithProofs(
+                    SignedBidSubmissionV4WithProofs {
+                        inner,
+                        proofs: inclusion_proofs.unwrap(),
+                    },
+                ))
+            } else {
+                SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(inner))
+            }
+        } else {
+            let inner = SignedBidSubmissionV3 {
                 message,
                 execution_payload,
                 blobs_bundle,
                 signature,
-            }))
-        } else {
-            SubmitBlockRequest::DenebWithProofs(DenebSubmitBlockWithProofsRequest(
-                SignedBidSubmissionV3WithProofs {
-                    inner: SignedBidSubmissionV3 {
-                        message,
-                        execution_payload,
-                        blobs_bundle,
-                        signature,
+            };
+
+            if inclusion_proofs.is_some() {
+                SubmitBlockRequest::DenebWithProofs(DenebSubmitBlockWithProofsRequest(
+                    SignedBidSubmissionV3WithProofs {
+                        inner,
+                        proofs: inclusion_proofs.unwrap(),
                     },
-                    proofs: inclusion_proofs.unwrap(),
-                },
-            ))
+                ))
+            } else {
+                SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(inner))
+            }
         }
     } else {
         let execution_payload = capella_payload;

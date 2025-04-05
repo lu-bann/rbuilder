@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use crate::primitives::{constraints::SignedConstraints, mev_boost::MevBoostRelaySlotInfoProvider};
+use ahash::HashMap;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use reqwest_eventsource::{Event, EventSource};
 use tokio_util::sync::CancellationToken;
 
@@ -13,14 +17,17 @@ pub struct ConstraintSubscriber {
 }
 
 impl ConstraintSubscriber {
-    pub fn new(relays: Vec<MevBoostRelaySlotInfoProvider>, global_cancellation: CancellationToken) -> Self {
+    pub fn new(
+        relays: Vec<MevBoostRelaySlotInfoProvider>,
+        global_cancellation: CancellationToken,
+    ) -> Self {
         Self {
             relays,
             global_cancellation,
         }
     }
 
-    pub fn spawn(self) -> mpsc::UnboundedReceiver<SignedConstraints> {
+    pub fn subscribe(self) -> mpsc::UnboundedReceiver<SignedConstraints> {
         let (send, receive) = mpsc::unbounded_channel();
 
         info!("Starting constraint subscriber");
@@ -66,4 +73,35 @@ impl ConstraintSubscriber {
 
         receive
     }
+}
+
+
+/// Spawn constraint subscriber
+pub async fn spawn_constraint_subscriber(
+    constraint_subscriber: Option<ConstraintSubscriber>,
+    constraint_store: Arc<RwLock<HashMap<u64, Vec<SignedConstraints>>>>,
+    global_cancel: CancellationToken,
+) -> eyre::Result<()> {
+    if let Some(subscriber) = constraint_subscriber {
+        let mut constraint_stream_channel = subscriber.subscribe();
+        tokio::spawn({
+            async move {
+                while let Some(constraint) = constraint_stream_channel.recv().await {
+                    constraint_store
+                        .write()
+                        .entry(constraint.message.slot)
+                        .or_default()
+                        .push(constraint.clone());
+                    info!("Wrote constraint to constraint-store: {:?}", constraint);
+                }
+
+                info!("Constraint stream channel closed");
+                global_cancel.cancel();
+            }
+        });
+    } else {
+        error!("No constraint subscriber provided");
+    }
+
+    Ok(())
 }

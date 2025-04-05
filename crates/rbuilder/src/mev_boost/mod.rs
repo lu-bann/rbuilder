@@ -493,6 +493,10 @@ impl RelayClient {
                         data.0.inner.as_ssz_bytes()
                     }
                     SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
+                    SubmitBlockRequest::ElectraWithProofs(data) => {
+                        url.set_path("/relay/v1/builder/blocks_with_proofs");
+                        data.0.inner.as_ssz_bytes()
+                    }
 
                 },
                 SSZ_CONTENT_TYPE,

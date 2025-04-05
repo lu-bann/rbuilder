@@ -3,7 +3,12 @@ use std::{fmt::Debug, sync::Arc};
 
 use alloy_primitives::B256;
 use alloy_provider::{Provider, RootProvider};
-use rbuilder::{mev_boost::submission::SubmitBlockRequest, utils::http_provider};
+use rbuilder::{
+    mev_boost::submission::{
+        DenebSubmitBlockRequest, ElectraSubmitBlockRequest, SubmitBlockRequest,
+    },
+    utils::http_provider,
+};
 use serde::Serialize;
 use serde_with::{serde_as, DisplayFromStr};
 use tokio::sync::mpsc;
@@ -71,8 +76,21 @@ impl ValidationAPIClient {
         let method = match req {
             SubmitBlockRequest::Capella(_) => "flashbots_validateBuilderSubmissionV2",
             SubmitBlockRequest::Deneb(_) => "flashbots_validateBuilderSubmissionV3",
+            SubmitBlockRequest::DenebWithProofs(_) => "flashbots_validateBuilderSubmissionV3",
             SubmitBlockRequest::Electra(_) => "flashbots_validateBuilderSubmissionV4",
-            SubmitBlockRequest::DenebWithProofs(_) => todo!(),
+            SubmitBlockRequest::ElectraWithProofs(_) => "flashbots_validateBuilderSubmissionV4",
+        };
+
+        let req = match req {
+            SubmitBlockRequest::Capella(_) => req.clone(),
+            SubmitBlockRequest::Deneb(_) => req.clone(),
+            SubmitBlockRequest::DenebWithProofs(req) => {
+                SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(req.0.inner.clone()))
+            }
+            SubmitBlockRequest::Electra(_) => req.clone(),
+            SubmitBlockRequest::ElectraWithProofs(req) => {
+                SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(req.0.inner.clone()))
+            }
         };
         let request = ValidRequest {
             req: req.clone(),

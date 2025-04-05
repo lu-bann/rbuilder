@@ -35,7 +35,7 @@ use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use block_list_provider::BlockListProvider;
 use building::BlockBuildingPool;
-use constraint_client::ConstraintSubscriber;
+use constraint_client::{spawn_constraint_subscriber, ConstraintSubscriber};
 use ethereum_consensus::configs::mainnet::SECONDS_PER_SLOT;
 use eyre::Context;
 use jsonrpsee::RpcModule;
@@ -227,25 +227,13 @@ where
             }
         };
 
-        let token = self.global_cancellation.clone();
         // Subscribe to the constraint stream
-        let mut constraint_stream_channel = self.constraint_subscriber.unwrap().spawn();
-        tokio::spawn({
-            let constraint_store_clone = self.constraint_store.clone();
-            async move {
-                while let Some(constraint) = constraint_stream_channel.recv().await {
-                    constraint_store_clone
-                        .write()
-                        .entry(constraint.message.slot)
-                        .or_default()
-                        .push(constraint.clone());
-                    info!("Wrote constraint to constraint-store: {:?}", constraint);
-                }
-
-                info!("Constraint stream channel closed");
-                token.cancel();
-            }
-        });
+        spawn_constraint_subscriber(
+            self.constraint_subscriber,
+            self.constraint_store.clone(),
+            self.global_cancellation.clone(),
+        )
+        .await?;
 
         while let Some(payload) = payload_events_channel.recv().await {
             reset_histogram_metrics();

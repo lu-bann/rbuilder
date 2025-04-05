@@ -229,7 +229,7 @@ mod test {
         let test_constraints: Vec<SignedConstraints> =
             serde_json::from_str(get_signed_constraints_json()).unwrap();
 
-        let mut constraint_stream_channel = constraint_subscriber.spawn();
+        let mut constraint_stream_channel = constraint_subscriber.subscribe();
         // Shared vector to collect received constraints
         let received_constraints = Arc::new(Mutex::new(Vec::new()));
         let received_constraints_clone = Arc::clone(&received_constraints);

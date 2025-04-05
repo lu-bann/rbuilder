@@ -14,6 +14,16 @@ use crate::primitives::{proofs::InclusionProofs, OrderId};
 pub struct ElectraSubmitBlockRequest(pub SignedBidSubmissionV4);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ElectraSubmitBlockRequestWithProofs(pub SignedBidSubmissionV4WithProofs);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignedBidSubmissionV4WithProofs {
+    pub inner: SignedBidSubmissionV4,
+    /// Merkle proofs
+    pub proofs: InclusionProofs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DenebSubmitBlockWithProofsRequest(pub SignedBidSubmissionV3WithProofs);
 
 /// Submission for the `/relay/v1/builder/blocks_with_proofs` endpoint (Deneb).
@@ -41,8 +51,9 @@ pub struct CapellaSubmitBlockRequest(pub SignedBidSubmissionV2);
 pub enum SubmitBlockRequest {
     Capella(CapellaSubmitBlockRequest),
     Deneb(DenebSubmitBlockRequest),
-    Electra(ElectraSubmitBlockRequest),
     DenebWithProofs(DenebSubmitBlockWithProofsRequest),
+    Electra(ElectraSubmitBlockRequest),
+    ElectraWithProofs(ElectraSubmitBlockRequestWithProofs),
 }
 
 impl SubmitBlockRequest {
@@ -52,6 +63,7 @@ impl SubmitBlockRequest {
             SubmitBlockRequest::Deneb(req) => &req.0.message,
             SubmitBlockRequest::Electra(req) => &req.0.message,
             SubmitBlockRequest::DenebWithProofs(req) => &req.0.inner.message,
+            SubmitBlockRequest::ElectraWithProofs(req) => &req.0.inner.message,
         }
     }
 
