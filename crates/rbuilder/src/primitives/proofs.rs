@@ -1,14 +1,16 @@
 use alloy_primitives::{Bytes, TxHash};
 use alloy_rlp::Encodable;
 use ethereum_consensus::{
-    bellatrix::presets::minimal::Transaction, deneb::minimal::MAX_TRANSACTIONS_PER_PAYLOAD,
-    phase0::Bytes32, ssz::prelude::*,
+    bellatrix::presets::minimal::Transaction, phase0::Bytes32, ssz::prelude::*,
 };
 use reth_primitives::TransactionSigned;
 
 pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
 
 pub type ExecutionPayloadTransactions = List<Transaction, MAX_TRANSACTIONS_PER_PAYLOAD>;
+
+const MAX_BYTES_PER_TRANSACTION: usize = 1_073_741_824; // 1 GiB
+const MAX_TRANSACTIONS_PER_PAYLOAD: usize = 1_048_576; // 2^20
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProofError {
@@ -43,23 +45,25 @@ pub fn calculate_merkle_multi_proofs(
     payload_transactions: Vec<TransactionSigned>,
     constraints: Vec<TransactionSigned>,
 ) -> Result<InclusionProofs, ProofError> {
-    let mut raw_txs = Vec::with_capacity(payload_transactions.len());
-    for tx in payload_transactions.clone() {
+    let mut inner: Vec<List<u8, MAX_BYTES_PER_TRANSACTION>> =
+        Vec::with_capacity(payload_transactions.len());
+    for (i, tx) in payload_transactions.clone().into_iter().enumerate() {
         let mut tx_bytes = Vec::new();
         tx.encode(&mut tx_bytes);
-        raw_txs.push(Bytes::from(tx_bytes));
+
+        let tx_list = List::<u8, MAX_BYTES_PER_TRANSACTION>::try_from(tx_bytes).expect(&format!(
+            "Failed to convert Vec<u8> to List<u8, {}> at index {}",
+            MAX_BYTES_PER_TRANSACTION, i
+        ));
+
+        inner.push(tx_list);
     }
 
-    let ssz_txs: List<List<u8, 1073741824>, 1048576> = {
-        let inner: Vec<List<u8, 1073741824>> = raw_txs
-            .into_iter()
-            .map(|tx| List::try_from(tx.to_vec()).unwrap())
-            .collect();
+    let ssz_txs =
+        List::<List<u8, MAX_BYTES_PER_TRANSACTION>, MAX_TRANSACTIONS_PER_PAYLOAD>::try_from(inner)
+            .expect("Failed to convert Vec<List<u8, MAX_BYTES_PER_TRANSACTION>> to outer List");
 
-        List::try_from(inner).unwrap()
-    };
-
-    let _root_node = ssz_txs.hash_tree_root().unwrap();
+    let root = ssz_txs.hash_tree_root().unwrap();
 
     let mut indexes: Vec<usize> = Vec::with_capacity(constraints.len());
     for constraint in constraints.clone() {
@@ -71,13 +75,31 @@ pub fn calculate_merkle_multi_proofs(
         indexes.push(index);
     }
 
-    let path = indexes
-        .iter()
-        .map(|i| PathElement::from(*i))
-        .collect::<Vec<PathElement>>();
+    let indices: Vec<[PathElement; 1]> = indexes
+        .into_iter()
+        .map(|idx| [PathElement::from(idx)])
+        .collect();
+    let paths: Vec<&[PathElement]> = indices.iter().map(|p| &p[..]).collect();
 
-    let (multi_proof, witness) = ssz_txs.multi_prove(&[&path]).unwrap();
-    assert!(multi_proof.verify(witness).is_ok());
+    let result = ssz_txs.multi_prove(&paths);
+    println!("MultiProof result: {:?}", result);
+    let (multi_proof, witness) = result.unwrap();
+
+    assert_eq!(
+        multi_proof.indices.len(),
+        constraints.len(),
+        "Proof should contain exactly two indices"
+    );
+    assert_eq!(
+        multi_proof.leaves.len(),
+        constraints.len(),
+        "Proof should contain exactly two leaves"
+    );
+    assert!(
+        multi_proof.verify(witness).is_ok(),
+        "Proof verification should succeed"
+    );
+    assert_eq!(root, witness, "Witness should match the root hash");
     let inclusion_proof = create_inclusion_proof_from_multi_proof(multi_proof, constraints)?;
 
     Ok(inclusion_proof)
@@ -134,7 +156,14 @@ mod tests {
                 tx.inner().clone()
             })
             .collect::<Vec<TransactionSigned>>();
-        let constraints = vec![payload_txs[3].clone()];
+
+        println!("Payload transactions: {:?}", payload_txs.len());
+
+        let constraints = vec![
+            payload_txs[1].clone(),
+            payload_txs[2].clone(),
+            payload_txs[3].clone(),
+        ];
 
         let inclusion_proof = calculate_merkle_multi_proofs(payload_txs.clone(), constraints);
         assert!(inclusion_proof.is_ok())
