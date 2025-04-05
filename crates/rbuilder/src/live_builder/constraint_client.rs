@@ -1,4 +1,4 @@
-use crate::primitives::{constraints::SignedConstraints, mev_boost::MevBoostRelay};
+use crate::primitives::{constraints::SignedConstraints, mev_boost::MevBoostRelaySlotInfoProvider};
 use futures::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
 use tokio_util::sync::CancellationToken;
@@ -8,12 +8,12 @@ use tracing::{debug, error, info};
 
 #[derive(Debug)]
 pub struct ConstraintSubscriber {
-    relays: Vec<MevBoostRelay>,
+    relays: Vec<MevBoostRelaySlotInfoProvider>,
     global_cancellation: CancellationToken,
 }
 
 impl ConstraintSubscriber {
-    pub fn new(relays: Vec<MevBoostRelay>, global_cancellation: CancellationToken) -> Self {
+    pub fn new(relays: Vec<MevBoostRelaySlotInfoProvider>, global_cancellation: CancellationToken) -> Self {
         Self {
             relays,
             global_cancellation,
@@ -26,7 +26,7 @@ impl ConstraintSubscriber {
         info!("Starting constraint subscriber");
 
         let relay = self.relays.first().expect("at least one relay");
-        let request = relay.client.build_constraint_stream_request();
+        let request = relay.client().build_constraint_stream_request();
         let event_source = EventSource::new(request).unwrap_or_else(|err| {
             panic!("Failed to create EventSource: {:?}", err);
         });

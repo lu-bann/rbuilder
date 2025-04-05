@@ -484,7 +484,7 @@ where
                 slot_time = ?slot_time,
                 deadline = ?deadline,
                 "Block header not found, sleeping for {:?}",
-                time_to_sleep
+                sleep_duration
             );
             break;
         }

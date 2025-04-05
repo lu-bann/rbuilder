@@ -8,10 +8,21 @@ use alloy_rpc_types_engine::{BlobsBundleV1, ExecutionPayloadV3};
 use serde::{Deserialize, Serialize};
 use ssz::{Decode, DecodeError, Encode};
 
-use crate::primitives::OrderId;
+use crate::primitives::{proofs::InclusionProofs, OrderId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ElectraSubmitBlockRequest(pub SignedBidSubmissionV4);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DenebSubmitBlockWithProofsRequest(pub SignedBidSubmissionV3WithProofs);
+
+/// Submission for the `/relay/v1/builder/blocks_with_proofs` endpoint (Deneb).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignedBidSubmissionV3WithProofs {
+    pub inner: SignedBidSubmissionV3,
+    /// Merkle proofs
+    pub proofs: InclusionProofs,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DenebSubmitBlockRequest(pub SignedBidSubmissionV3);
@@ -31,6 +42,7 @@ pub enum SubmitBlockRequest {
     Capella(CapellaSubmitBlockRequest),
     Deneb(DenebSubmitBlockRequest),
     Electra(ElectraSubmitBlockRequest),
+    DenebWithProofs(DenebSubmitBlockWithProofsRequest),
 }
 
 impl SubmitBlockRequest {
@@ -39,6 +51,7 @@ impl SubmitBlockRequest {
             SubmitBlockRequest::Capella(req) => &req.0.message,
             SubmitBlockRequest::Deneb(req) => &req.0.message,
             SubmitBlockRequest::Electra(req) => &req.0.message,
+            SubmitBlockRequest::DenebWithProofs(req) => &req.0.inner.message,
         }
     }
 
@@ -126,6 +139,7 @@ impl serde::Serialize for SubmitBlockRequestNoBlobs<'_> {
                 }
                 .serialize(serializer)
             }
+            _ => unimplemented!()
         }
     }
 }

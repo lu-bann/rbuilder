@@ -4,7 +4,7 @@ use ethereum_consensus::{
     primitives::{BlsPublicKey, BlsSignature},
     ssz::prelude::*,
 };
-use reth_primitives::PooledTransactionsElement;
+use reth_primitives::PooledTransaction;
 use sha2::{Digest, Sha256};
 
 pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
@@ -34,7 +34,7 @@ impl ConstraintsMessage {
             // Convert the opaque bytes to a EIP-2718 envelope and obtain the tx hash.
             // this is needed to handle type 3 transactions.
             // FIXME: don't unwrap here and handle the error properly
-            let tx = PooledTransactionsElement::decode_2718(&mut tx.as_slice()).unwrap();
+            let tx = PooledTransaction::decode_2718(&mut tx.as_slice()).unwrap();
             hasher.update(tx.hash().as_slice());
         }
 

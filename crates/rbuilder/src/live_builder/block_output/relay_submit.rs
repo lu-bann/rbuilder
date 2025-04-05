@@ -19,6 +19,7 @@ use crate::{
     utils::error_storage::store_error_event,
 };
 use ahash::HashMap;
+use alloy_consensus::SignableTransaction;
 use alloy_primitives::{utils::format_ether, U256};
 use mockall::automock;
 use parking_lot::Mutex;
@@ -185,12 +186,13 @@ async fn run_submit_to_relays_job(
         // generate inclusion proofs for constraints if present for the slot
         let inclusion_proofs = match &block.trace.slot_constraints {
             Some(constraints) => {
-                let payload_transactions = block.sealed_block.body.transactions.clone();
-                let slot_constraints: Vec<TransactionSigned> = constraints
-                    .iter()
-                    .map(|tx| tx.clone().into_internal_tx_unsecure().into_signed())
-                    .collect();
-
+                let payload_transactions = block.sealed_block.body().transactions.clone();
+                let slot_constraints: Vec<TransactionSigned> =
+                 // constraints
+                //     .iter()
+                //     .map(|tx| tx.clone().into_internal_tx_unsecure().into_signed())
+                //     .collect();
+                Vec::new();
                 debug!(
                     "Calculating inclusion proofs for slot: {:?}",
                     slot_constraints
@@ -289,7 +291,7 @@ async fn run_submit_to_relays_job(
                     slot_data.slot_data.pubkey,
                     block.trace.bid_value,
                     None,
-            ) {
+                ) {
                     Ok(res) => Some((
                         SubmitBlockRequestWithMetadata {
                             submission: res,

@@ -141,10 +141,12 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
                     if block.built_block_trace().got_no_signer_error {
                         use_suggested_fee_recipient_as_coinbase = false;
                     }
-                    input.sink.new_block(block);
+                    if let Ok(block) = BiddableUnfinishedBlock::new(block) {
+                        input.sink.new_block(block);
+                    }
                 }
                 Err(err) => {
-                    if !handle_building_error(err) {
+                    if !handle_building_error(err, payload_id) {
                         break 'building;
                     }
                 }
@@ -301,9 +303,9 @@ impl OrderingBuilderContext {
         Ok(Box::new(block_building_helper))
     }
 
-    pub fn build_blocks_with_constraints(
+    pub fn build_blocks_with_constraints<OrderPriorityType: OrderPriority>(
         &mut self,
-        block_orders: PrioritizedOrderStore,
+        block_orders: PrioritizedOrderStore<OrderPriorityType>,
         use_suggested_fee_recipient_as_coinbase: bool,
         cancel_block: CancellationToken,
         slot_constraints: Vec<SignedConstraints>,
@@ -346,117 +348,7 @@ impl OrderingBuilderContext {
         Ok(Box::new(block_building_helper))
     }
 
-    pub fn build_blocks_with_constraints(
-        &mut self,
-        block_orders: PrioritizedOrderStore,
-        use_suggested_fee_recipient_as_coinbase: bool,
-        cancel_block: CancellationToken,
-        slot_constraints: Vec<SignedConstraints>,
-    ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
-        let build_attempt_id: u32 = rand::random();
-        let span = info_span!("build_run", build_attempt_id);
-        let _guard = span.enter();
-
-        let build_start = Instant::now();
-
-        // Create a new ctx to remove builder_signer if necessary
-        let mut new_ctx = self.ctx.clone();
-        if use_suggested_fee_recipient_as_coinbase {
-            new_ctx.modify_use_suggested_fee_recipient_as_coinbase();
-        }
-        self.failed_orders.clear();
-        self.order_attempts.clear();
-
-        let mut block_building_helper = BlockBuildingHelperFromProvider::new(
-            self.provider.clone(),
-            new_ctx,
-            self.cached_reads.take(),
-            self.builder_name.clone(),
-            self.config.discard_txs,
-            self.config.sorting.into(),
-            cancel_block,
-        )?;
-
-        // fill constraints
-        let constraints = self.fill_constraints(
-            &mut block_building_helper,
-            slot_constraints,
-            block_orders.clone(),
-            build_start,
-        )?;
-        block_building_helper.set_constraints(constraints);
-
-        self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
-        block_building_helper.set_trace_fill_time(build_start.elapsed());
-        self.cached_reads = Some(block_building_helper.clone_cached_reads());
-        Ok(Box::new(block_building_helper))
-    }
-
-    fn fill_constraints(
-        &mut self,
-        block_building_helper: &mut dyn BlockBuildingHelper,
-        slot_constraints: Vec<SignedConstraints>,
-        mut block_orders: PrioritizedOrderStore,
-        build_start: Instant,
-    ) -> eyre::Result<Vec<TransactionSignedEcRecoveredWithBlobs>> {
-        let mut result = Vec::new();
-        for constraint in slot_constraints {
-            let transactions = constraint.message.transactions.to_vec();
-            for tx in transactions {
-                if let Some(deadline) = self.config.build_duration_deadline() {
-                    if build_start.elapsed() > deadline {
-                        break;
-                    }
-                }
-
-                let start_time = Instant::now();
-                let tx_bytes = tx.to_vec();
-                let tx = TransactionSignedEcRecoveredWithBlobs::decode_enveloped_with_real_blobs(
-                    alloy_primitives::Bytes::from(tx_bytes),
-                )?;
-                let tx_hash = tx.internal_tx_unsecure().hash().to_string();
-                let commit_result = block_building_helper.commit_constraint(&tx)?;
-                let order_commit_time = start_time.elapsed();
-                let mut gas_used = 0;
-                let mut execution_error = None;
-                let success = commit_result.is_ok();
-                match commit_result {
-                    Ok(res) => {
-                        gas_used = res.gas_used;
-                        let nonces_updated: Vec<_> = res
-                            .nonces_updated
-                            .iter()
-                            .map(|(account, nonce)| AccountNonce {
-                                account: *account,
-                                nonce: *nonce,
-                            })
-                            .collect();
-                        block_orders.update_onchain_nonces(&nonces_updated);
-                    }
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            "Error committing constraint, block submission will fail"
-                        );
-                        execution_error = Some(err);
-                    }
-                }
-                trace!(
-                    order_id = tx_hash,
-                    success,
-                    order_commit_time_mus = order_commit_time.as_micros(),
-                    gas_used,
-                    ?execution_error,
-                    "Executed order"
-                );
-                result.push(tx);
-            }
-        }
-
-        Ok(result)
-    }
-
-    fn fill_constraints(
+    fn fill_constraints<OrderPriorityType: OrderPriority>(
         &mut self,
         block_building_helper: &mut dyn BlockBuildingHelper,
         slot_constraints: Vec<SignedConstraints>,
@@ -647,7 +539,7 @@ where
             builder_name: self.name.clone(),
             cancel: input.cancel,
         };
-        run_ordering_builder(live_input, &self.config, Some(slot_constraints));
+        run_ordering_builder::<P, OrderPriorityType>(live_input, &self.config, Some(slot_constraints));
     }
 }
 

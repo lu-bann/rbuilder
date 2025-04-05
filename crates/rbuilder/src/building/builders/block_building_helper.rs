@@ -17,7 +17,7 @@ use crate::{
         EstimatePayoutGasErr, ExecutionError, ExecutionResult, FinalizeError, FinalizeResult,
         PartialBlock,
     },
-    primitives::{SimValue, SimulatedOrder},
+    primitives::{SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
     telemetry::{self, add_block_fill_time, add_order_simulation_time},
     utils::{check_block_hash_reader_health, HistoricalBlockError},
 };
@@ -390,15 +390,15 @@ impl BlockBuildingHelper for BlockBuildingHelperFromProvider {
                 Ok(res) => {
                     self.built_block_trace.add_included_order(res);
                     let last_order = self.built_block_trace.included_orders.last().unwrap();
-                    (Ok(Ok(last_order.to_owned())), true)
+                    Ok(Ok(last_order.to_owned()))
                 }
                 Err(err) => {
                     self.built_block_trace
                         .modify_payment_when_no_signer_error(&err);
-                    (Ok(Err(err)), false)
+                    Ok(Err(err))
                 }
             },
-            Err(e) => (Err(e), false),
+            Err(e) => Err(e)
         }
     }
 
