@@ -317,7 +317,7 @@ where
                 Some(cutoff_duration) => {
                     let current_time = OffsetDateTime::now_utc();
                     let time_to_slot = payload.timestamp() - current_time;
-                    let time_until_constraints_cutoff = (time_to_slot - cutoff_duration)
+                    let time_until_constraints_cutoff = (time_to_slot + cutoff_duration)
                         .saturating_sub(time::Duration::seconds(
                             SECONDS_PER_SLOT.try_into().unwrap(),
                         ));
