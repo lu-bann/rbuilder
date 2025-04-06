@@ -6,6 +6,7 @@ use ethereum_consensus::{
     bellatrix::presets::minimal::Transaction, phase0::Bytes32, ssz::prelude::*,
 };
 use reth_primitives::TransactionSigned;
+use tracing::info;
 use tree_hash::Hash256;
 
 pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
@@ -112,6 +113,10 @@ pub fn generate_inclusion_proofs(
     constraints: &Vec<SignedConstraints>,
     verify_proof: bool,
 ) -> Result<InclusionProofs, ProofError> {
+    info!(
+        num_of_txs = payload_transactions.len(),
+        "Generating inclusion proofs"
+    );
     let mut inner: Vec<List<u8, MAX_BYTES_PER_TRANSACTION>> =
         Vec::with_capacity(payload_transactions.len());
     for (i, tx) in payload_transactions.clone().into_iter().enumerate() {
@@ -154,6 +159,7 @@ pub fn generate_inclusion_proofs(
         .multi_prove(&paths)
         .map_err(|_| ProofError::FailedToGenerateProof)?;
     assert_eq!(root, witness);
+    info!("Multi proofs generated");
 
     ssz_rs::multiproofs::verify_merkle_multiproof(
         &multi_proof.leaves,
@@ -163,10 +169,12 @@ pub fn generate_inclusion_proofs(
     )
     .map_err(|_| ProofError::VerificationFailed)?;
 
+    info!("Createing inclusiong proofs from merkle proofs");
     let inclusion_proof = create_inclusion_proof_from_multi_proof(multi_proof, constraint_txs)?;
 
     // Verify the multiproof if requested
     if verify_proof {
+        info!("Verifying inclusion proofs");
         let proof_data_vec: Vec<SignedConstraintsWithProofData> = constraints
             .iter()
             .map(|c| {
