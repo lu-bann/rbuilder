@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info_span, trace, warn};
+use tracing::{error, info, info_span, trace, warn};
 
 use super::{
     block_building_helper::{BiddableUnfinishedBlock, BlockBuildingHelperFromProvider},
@@ -311,6 +311,7 @@ impl OrderingBuilderContext {
         cancel_block: CancellationToken,
         slot_constraints: Vec<SignedConstraints>,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
+        info!("build_blocks_with_constraintss");
         let build_attempt_id: u32 = rand::random();
         let span = info_span!("build_run", build_attempt_id);
         let _guard = span.enter();
@@ -347,6 +348,7 @@ impl OrderingBuilderContext {
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
         self.cached_reads = Some(block_building_helper.clone_cached_reads());
+        info!("Finish build_blocks_with_constraints");
         Ok(Box::new(block_building_helper))
     }
 
