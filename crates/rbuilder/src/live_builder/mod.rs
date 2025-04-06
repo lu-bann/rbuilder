@@ -76,7 +76,7 @@ impl TimingsConfig {
             slot_proposal_duration: Duration::from_secs(4),
             block_header_deadline_delta: time::Duration::milliseconds(-2500),
             get_block_header_period: time::Duration::milliseconds(250),
-            receive_constraints_cuttoff_duration: Some(time::Duration::seconds(5)),
+            receive_constraints_cuttoff_duration: Some(time::Duration::seconds(8)),
         }
     }
 
@@ -312,30 +312,37 @@ where
 
             inc_active_slots();
 
-            info!("Sleeping for 6s");
-            tokio::time::sleep(Duration::from_secs(6)).await;
+            // If we have a constraints cuttoff time, we should wait until it passes before
+            match timings.receive_constraints_cuttoff_duration {
+                Some(cutoff_duration) => {
+                    let current_time = OffsetDateTime::now_utc();
+                    let time_to_slot = payload.timestamp() - current_time;
+                    let time_until_constraints_cutoff = (time_to_slot - cutoff_duration)
+                        .saturating_sub(time::Duration::seconds(
+                            SECONDS_PER_SLOT.try_into().unwrap(),
+                        ));
 
-            // // If we have a constraints cuttoff time, we should wait until it passes before
-            // match timings.receive_constraints_cuttoff_duration {
-            //     Some(cuttoff_duration) => {
-            //         let time_until_constraints_cuttoff = (time_to_slot + cuttoff_duration)
-            //             .saturating_sub(time::Duration::seconds(
-            //                 SECONDS_PER_SLOT.try_into().unwrap(),
-            //             ));
-            //         if time_until_constraints_cuttoff.is_negative() {
-            //             debug!(
-            //                 slot = payload.slot(),
-            //                 "Constraints cuttoff time hasn't passed, sleeping for {}s",
-            //                 time_until_constraints_cuttoff.as_seconds_f64().abs()
-            //             );
-            //             tokio::time::sleep(Duration::from_secs_f64(
-            //                 time_until_constraints_cuttoff.as_seconds_f64().abs(),
-            //             ))
-            //             .await;
-            //         };
-            //     }
-            //     None => debug!("No constraints cuttoff time, proceeding with block building"),
-            // };
+                    if time_until_constraints_cutoff.is_positive() {
+                        debug!(
+                            slot = payload.slot(),
+                            time_left = ?time_to_slot,
+                            "Constraints cutoff time hasn't passed yet, sleeping for {}s",
+                            time_until_constraints_cutoff.as_seconds_f64()
+                        );
+                        tokio::time::sleep(Duration::from_secs_f64(
+                            time_until_constraints_cutoff.as_seconds_f64(),
+                        ))
+                        .await;
+                    } else {
+                        debug!(
+                            slot = payload.slot(),
+                            time_left = ?time_to_slot,
+                            "Constraints cutoff time has already passed, proceeding immediately"
+                        );
+                    }
+                }
+                None => debug!("No constraints cuttoff time, proceeding with block building"),
+            };
 
             let root_hasher =
                 Arc::from(self.provider.root_hasher(payload.parent_block_num_hash())?);
