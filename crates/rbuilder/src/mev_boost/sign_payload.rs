@@ -27,6 +27,7 @@ use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_primitives::SealedBlock;
 use serde_with::{serde_as, DisplayFromStr};
 use std::sync::Arc;
+use tracing::debug;
 
 /// Object to sign blocks to be sent to relays.
 #[derive(Debug, Clone)]
@@ -210,14 +211,24 @@ pub fn sign_block_for_relay(
             };
 
             if inclusion_proofs.is_some() {
-                SubmitBlockRequest::ElectraWithProofs(ElectraSubmitBlockRequestWithProofs(
-                    SignedBidSubmissionV4WithProofs {
+                let request = SubmitBlockRequest::ElectraWithProofs(
+                    ElectraSubmitBlockRequestWithProofs(SignedBidSubmissionV4WithProofs {
                         inner,
                         proofs: inclusion_proofs.unwrap(),
-                    },
-                ))
+                    }),
+                );
+                debug!(
+                    submission_request = ?request,
+                    "ElectraSubmitBlockRequestWithProofs"
+                );
+                request
             } else {
-                SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(inner))
+                let request = SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(inner));
+                debug!(
+                    submission_request = ?request,
+                    "ElectraSubmitBlockRequest"
+                );
+                request
             }
         } else {
             let inner = SignedBidSubmissionV3 {

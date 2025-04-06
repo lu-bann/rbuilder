@@ -23,6 +23,7 @@ use crate::{
     utils::NonceCache,
 };
 use ahash::{HashMap, HashSet};
+use alloy_primitives::hex::FromHex;
 use derivative::Derivative;
 use reth::revm::cached::CachedReads;
 use reth_provider::StateProvider;
@@ -130,7 +131,7 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
         let orders = order_intake_consumer.current_block_orders();
 
         if let Some(ref slot_constraints) = slot_constraints {
-            match builder.build_blocks_with_constraints(
+            match builder.build_block_with_constraints(
                 orders,
                 use_suggested_fee_recipient_as_coinbase
                     && input.sink.can_use_suggested_fee_recipient_as_coinbase(),
@@ -303,7 +304,7 @@ impl OrderingBuilderContext {
         Ok(Box::new(block_building_helper))
     }
 
-    pub fn build_blocks_with_constraints<OrderPriorityType: OrderPriority>(
+    pub fn build_block_with_constraints<OrderPriorityType: OrderPriority>(
         &mut self,
         block_orders: PrioritizedOrderStore<OrderPriorityType>,
         use_suggested_fee_recipient_as_coinbase: bool,
@@ -333,7 +334,7 @@ impl OrderingBuilderContext {
             cancel_block,
         )?;
 
-        // fill constraints
+        // fill constraints first
         self.fill_constraints(
             &mut block_building_helper,
             slot_constraints.clone(),
@@ -342,6 +343,7 @@ impl OrderingBuilderContext {
         )?;
         block_building_helper.set_constraints(slot_constraints);
 
+        // Then fill the remaining orders
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
         self.cached_reads = Some(block_building_helper.clone_cached_reads());
@@ -365,9 +367,8 @@ impl OrderingBuilderContext {
                 }
 
                 let start_time = Instant::now();
-                let tx_bytes = tx.to_vec();
                 let tx = TransactionSignedEcRecoveredWithBlobs::decode_enveloped_with_real_blobs(
-                    alloy_primitives::Bytes::from(tx_bytes),
+                    alloy_primitives::Bytes::from_hex(tx)?,
                 )?;
                 let tx_hash = tx.internal_tx_unsecure().hash().to_string();
                 let commit_result = block_building_helper.commit_constraint(&tx)?;
@@ -537,7 +538,11 @@ where
             builder_name: self.name.clone(),
             cancel: input.cancel,
         };
-        run_ordering_builder::<P, OrderPriorityType>(live_input, &self.config, Some(slot_constraints));
+        run_ordering_builder::<P, OrderPriorityType>(
+            live_input,
+            &self.config,
+            Some(slot_constraints),
+        );
     }
 }
 

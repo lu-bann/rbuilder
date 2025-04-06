@@ -421,4 +421,12 @@ where
         };
         run_parallel_builder(live_input, &self.config);
     }
+
+    fn build_blocks_with_constraints(
+        &self,
+        _input: BlockBuildingAlgorithmInput<P>,
+        _slot_constraints: Vec<crate::primitives::constraints::SignedConstraints>,
+    ) {
+        unimplemented!()
+    }
 }

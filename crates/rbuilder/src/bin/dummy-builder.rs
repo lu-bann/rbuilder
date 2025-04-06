@@ -247,4 +247,12 @@ where
             }
         }
     }
+
+    fn build_blocks_with_constraints(
+        &self,
+        _input: BlockBuildingAlgorithmInput<P>,
+        _slot_constraints: Vec<rbuilder::primitives::constraints::SignedConstraints>,
+    ) {
+        unimplemented!()
+    }
 }

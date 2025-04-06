@@ -192,7 +192,7 @@ async fn run_submit_to_relays_job(
                 );
 
                 Some(
-                    generate_inclusion_proofs(payload_transactions, slot_constraints, false)
+                    generate_inclusion_proofs(payload_transactions, slot_constraints, true)
                         .unwrap(),
                 )
             }

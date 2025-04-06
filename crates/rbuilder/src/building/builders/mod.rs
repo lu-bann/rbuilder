@@ -219,10 +219,9 @@ where
     fn build_blocks(&self, input: BlockBuildingAlgorithmInput<P>);
     fn build_blocks_with_constraints(
         &self,
-        _input: BlockBuildingAlgorithmInput<P>,
-        _slot_constraints: Vec<SignedConstraints>,
-    ) {
-    }
+        input: BlockBuildingAlgorithmInput<P>,
+        slot_constraints: Vec<SignedConstraints>,
+    );
 }
 
 /// Factory used to create UnfinishedBlockBuildingSink for builders.
