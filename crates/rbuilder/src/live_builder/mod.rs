@@ -312,6 +312,9 @@ where
 
             inc_active_slots();
 
+            info!("Sleeping for 6s");
+            tokio::time::sleep(Duration::from_secs(6)).await;
+
             // // If we have a constraints cuttoff time, we should wait until it passes before
             // match timings.receive_constraints_cuttoff_duration {
             //     Some(cuttoff_duration) => {
