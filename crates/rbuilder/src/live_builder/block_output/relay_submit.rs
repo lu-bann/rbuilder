@@ -191,7 +191,7 @@ async fn run_submit_to_relays_job(
                     slot_constraints
                 );
 
-                match generate_inclusion_proofs(payload_transactions, slot_constraints, false) {
+                match generate_inclusion_proofs(payload_transactions, slot_constraints, true) {
                     Ok(proofs) => Some(proofs),
                     Err(err) => {
                         error!(?err, "Failed to generate inclusion proofs");

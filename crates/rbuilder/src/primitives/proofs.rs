@@ -6,7 +6,7 @@ use ethereum_consensus::{
     bellatrix::presets::minimal::Transaction, phase0::Bytes32, ssz::prelude::*,
 };
 use reth_primitives::TransactionSigned;
-use tracing::info;
+use tracing::{info, warn};
 use tree_hash::Hash256;
 
 pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
@@ -191,7 +191,14 @@ pub fn generate_inclusion_proofs(
             .iter()
             .map(|proof_data| &proof_data.proof_data)
             .collect();
-        verify_inclusion_proofs(&constraints_proofs_data, &inclusion_proof, root)?;
+        match verify_inclusion_proofs(&constraints_proofs_data, &inclusion_proof, root) {
+            Ok(_) => {
+                info!("Inclusion proofs verification successfull")
+            }
+            Err(err) => {
+                warn!(?err, "Failed to verify inclusion proofs")
+            }
+        }
     }
 
     Ok(inclusion_proof)
