@@ -63,43 +63,43 @@ impl DenebSubmitBlockRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DenebSubmitBlockRequestWithProofs(pub SignedBidSubmissionV3WithProofs);
+// #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// pub struct DenebSubmitBlockRequestWithProofs(pub SignedBidSubmissionV3WithProofs);
 
-impl DenebSubmitBlockRequestWithProofs {
-    pub fn as_ssz_bytes(&self) -> Vec<u8> {
-        let mut ssz_bytes = Vec::new();
-        ssz_bytes.extend(self.0.message.as_ssz_bytes());
-        ssz_bytes.extend(self.0.execution_payload.as_ssz_bytes());
-        ssz_bytes.extend(self.0.blobs_bundle.as_ssz_bytes());
-        ssz_bytes.extend(self.0.signature.as_ssz_bytes());
-        ssz_bytes.extend(self.0.proofs.as_ssz_bytes());
-        ssz_bytes
-    }
-}
+// impl DenebSubmitBlockRequestWithProofs {
+//     pub fn as_ssz_bytes(&self) -> Vec<u8> {
+//         let mut ssz_bytes = Vec::new();
+//         ssz_bytes.extend(self.0.message.as_ssz_bytes());
+//         ssz_bytes.extend(self.0.execution_payload.as_ssz_bytes());
+//         ssz_bytes.extend(self.0.blobs_bundle.as_ssz_bytes());
+//         ssz_bytes.extend(self.0.signature.as_ssz_bytes());
+//         ssz_bytes.extend(self.0.proofs.as_ssz_bytes());
+//         ssz_bytes
+//     }
+// }
 
-/// Submission for the `/relay/v1/builder/blocks_with_proofs` endpoint (Deneb).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SignedBidSubmissionV3WithProofs {
-    pub message: BidTrace,
-    pub execution_payload: ExecutionPayloadV3,
-    pub blobs_bundle: BlobsBundleV1,
-    pub signature: BlsSignature,
-    /// The Merkle proofs of inclusion as needed by the Constraints API.
-    /// Reference: <https://docs.boltprotocol.xyz/technical-docs/api/builder#get_header_with_proofs>
-    pub proofs: InclusionProofs,
-}
+// /// Submission for the `/relay/v1/builder/blocks_with_proofs` endpoint (Deneb).
+// #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// pub struct SignedBidSubmissionV3WithProofs {
+//     pub message: BidTrace,
+//     pub execution_payload: ExecutionPayloadV3,
+//     pub blobs_bundle: BlobsBundleV1,
+//     pub signature: BlsSignature,
+//     /// The Merkle proofs of inclusion as needed by the Constraints API.
+//     /// Reference: <https://docs.boltprotocol.xyz/technical-docs/api/builder#get_header_with_proofs>
+//     pub proofs: InclusionProofs,
+// }
 
-impl From<SignedBidSubmissionV3WithProofs> for SignedBidSubmissionV3 {
-    fn from(value: SignedBidSubmissionV3WithProofs) -> Self {
-        Self {
-            message: value.message,
-            execution_payload: value.execution_payload,
-            blobs_bundle: value.blobs_bundle,
-            signature: value.signature,
-        }
-    }
-}
+// impl From<SignedBidSubmissionV3WithProofs> for SignedBidSubmissionV3 {
+//     fn from(value: SignedBidSubmissionV3WithProofs) -> Self {
+//         Self {
+//             message: value.message,
+//             execution_payload: value.execution_payload,
+//             blobs_bundle: value.blobs_bundle,
+//             signature: value.signature,
+//         }
+//     }
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CapellaSubmitBlockRequest(pub SignedBidSubmissionV2);
@@ -109,7 +109,7 @@ pub struct CapellaSubmitBlockRequest(pub SignedBidSubmissionV2);
 pub enum SubmitBlockRequest {
     Capella(CapellaSubmitBlockRequest),
     Deneb(DenebSubmitBlockRequest),
-    DenebWithProofs(DenebSubmitBlockRequestWithProofs),
+    // DenebWithProofs(DenebSubmitBlockRequestWithProofs),
     Electra(ElectraSubmitBlockRequest),
     ElectraWithProofs(ElectraSubmitBlockRequestWithProofs),
 }
@@ -119,7 +119,7 @@ impl SubmitBlockRequest {
         match self {
             SubmitBlockRequest::Capella(req) => &req.0.message,
             SubmitBlockRequest::Deneb(req) => &req.0.message,
-            SubmitBlockRequest::DenebWithProofs(req) => &req.0.message,
+            // SubmitBlockRequest::DenebWithProofs(req) => &req.0.message,
             SubmitBlockRequest::Electra(req) => &req.0.message,
             SubmitBlockRequest::ElectraWithProofs(req) => &req.0.message,
         }

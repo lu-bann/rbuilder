@@ -1,7 +1,6 @@
 use super::submission::{
-    CapellaSubmitBlockRequest, DenebSubmitBlockRequest, DenebSubmitBlockRequestWithProofs,
-    ElectraSubmitBlockRequest, ElectraSubmitBlockRequestWithProofs,
-    SignedBidSubmissionV3WithProofs, SignedBidSubmissionV4WithProofs, SubmitBlockRequest,
+    CapellaSubmitBlockRequest, DenebSubmitBlockRequest, ElectraSubmitBlockRequest,
+    ElectraSubmitBlockRequestWithProofs, SignedBidSubmissionV4WithProofs, SubmitBlockRequest,
 };
 use crate::{primitives::proofs::InclusionProofs, utils::u256decimal_serde_helper};
 use alloy_eips::{eip2718::Encodable2718, eip4844::BlobTransactionSidecar, eip7685::Requests};
@@ -234,24 +233,23 @@ pub fn sign_block_for_relay(
                 request
             }
         } else {
-            if inclusion_proofs.is_some() {
-                SubmitBlockRequest::DenebWithProofs(DenebSubmitBlockRequestWithProofs(
-                    SignedBidSubmissionV3WithProofs {
-                        message,
-                        execution_payload,
-                        blobs_bundle,
-                        signature,
-                        proofs: inclusion_proofs.unwrap(),
-                    },
-                ))
-            } else {
-                SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(SignedBidSubmissionV3 {
-                    message,
-                    execution_payload,
-                    blobs_bundle,
-                    signature,
-                }))
-            }
+            // if inclusion_proofs.is_some() {
+            //     SubmitBlockRequest::DenebWithProofs(DenebSubmitBlockRequestWithProofs(
+            //         SignedBidSubmissionV3WithProofs {
+            //             message,
+            //             execution_payload,
+            //             blobs_bundle,
+            //             signature,
+            //             proofs: inclusion_proofs.unwrap(),
+            //         },
+            //     ))
+            // }
+            SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(SignedBidSubmissionV3 {
+                message,
+                execution_payload,
+                blobs_bundle,
+                signature,
+            }))
         }
     } else {
         let execution_payload = capella_payload;

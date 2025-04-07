@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use ssz::Encode;
 use std::{io::Write, str::FromStr};
-use submission::{ElectraSubmitBlockRequestWithProofs, SubmitBlockRequest, SubmitBlockRequestNoBlobs, SubmitBlockRequestWithMetadata};
+use submission::{SubmitBlockRequest, SubmitBlockRequestNoBlobs, SubmitBlockRequestWithMetadata};
 use tracing::info;
 use url::Url;
 
@@ -489,10 +489,10 @@ impl RelayClient {
                 match &submission_with_metadata.submission {
                     SubmitBlockRequest::Capella(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::Deneb(data) => data.as_ssz_bytes(),
-                    SubmitBlockRequest::DenebWithProofs(data) => {
-                        url.set_path("/relay/v1/builder/blocks_with_proofs");
-                        data.as_ssz_bytes()
-                    }
+                    // SubmitBlockRequest::DenebWithProofs(data) => {
+                    //     url.set_path("/relay/v1/builder/blocks_with_proofs");
+                    //     data.as_ssz_bytes()
+                    // }
                     SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::ElectraWithProofs(data) => {
                         url.set_path("/relay/v1/builder/blocks_with_proofs");
@@ -509,8 +509,8 @@ impl RelayClient {
                 ))
             } else {
                 match &submission_with_metadata.submission {
-                    SubmitBlockRequest::DenebWithProofs(_)
-                    | SubmitBlockRequest::ElectraWithProofs(_) => {
+                    // SubmitBlockRequest::DenebWithProofs(_)
+                    SubmitBlockRequest::ElectraWithProofs(_) => {
                         url.set_path("/relay/v1/builder/blocks_with_proofs");
                     }
                     _ => {}
