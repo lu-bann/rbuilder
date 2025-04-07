@@ -518,6 +518,11 @@ impl RelayClient {
                 serde_json::to_vec(&submission_with_metadata.submission)
             };
 
+            let res = serde_json::from_slice::<SubmitBlockRequest>(
+                json_result.as_ref().unwrap().clone().as_slice(),
+            );
+            info!("json request {:?}", res);
+
             (
                 json_result.map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?,
                 JSON_CONTENT_TYPE,
@@ -544,7 +549,7 @@ impl RelayClient {
 
         info!("json body {:?}", Body::from(body_data.clone()));
         info!(
-            "json body {:?}",
+            "json body bytes {:?}",
             axum::body::to_bytes(
                 axum::body::Body::from(body_data.clone()),
                 (1024 * 1024 * 10) as usize
