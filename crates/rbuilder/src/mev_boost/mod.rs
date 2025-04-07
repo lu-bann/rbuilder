@@ -518,8 +518,6 @@ impl RelayClient {
                 serde_json::to_vec(&submission_with_metadata.submission)
             };
 
-            info!("json block {:?}", json_result);
-
             (
                 json_result.map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?,
                 JSON_CONTENT_TYPE,
@@ -544,7 +542,19 @@ impl RelayClient {
                 .map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?;
         }
 
+        info!("json body {:?}", Body::from(body_data.clone()));
+        info!(
+            "json body {:?}",
+            axum::body::to_bytes(
+                axum::body::Body::from(body_data.clone()),
+                (1024 * 1024 * 10) as usize
+            )
+            .await
+            .unwrap()
+        );
+
         builder = builder.headers(headers).body(Body::from(body_data));
+
         if fake_relay {
             builder = builder.header(
                 TOTAL_PAYMENT_HEADER,
