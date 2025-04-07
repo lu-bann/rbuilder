@@ -1,11 +1,13 @@
 use alloy_primitives::U256;
 use alloy_rpc_types_beacon::{
+    payload::beacon_payload_v3,
     relay::{BidTrace, SignedBidSubmissionV2, SignedBidSubmissionV3, SignedBidSubmissionV4},
     requests::ExecutionRequestsV4,
     BlsSignature,
 };
 use alloy_rpc_types_engine::{BlobsBundleV1, ExecutionPayloadV3};
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use ssz::{Decode, DecodeError, Encode};
 
 use crate::primitives::{proofs::InclusionProofs, OrderId};
@@ -29,10 +31,11 @@ impl ElectraSubmitBlockRequestWithProofs {
     }
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
 pub struct SignedBidSubmissionV4WithProofs {
     pub message: BidTrace,
+    #[serde(with = "beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     pub blobs_bundle: BlobsBundleV1,
     pub execution_requests: ExecutionRequestsV4,
