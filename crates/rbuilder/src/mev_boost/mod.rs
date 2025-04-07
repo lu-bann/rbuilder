@@ -19,6 +19,7 @@ use serde_with::{serde_as, DisplayFromStr};
 use ssz::Encode;
 use std::{io::Write, str::FromStr};
 use submission::{SubmitBlockRequest, SubmitBlockRequestNoBlobs, SubmitBlockRequestWithMetadata};
+use tracing::info;
 use url::Url;
 
 pub use error::*;
@@ -497,7 +498,6 @@ impl RelayClient {
                         url.set_path("/relay/v1/builder/blocks_with_proofs");
                         data.as_ssz_bytes()
                     }
-
                 },
                 SSZ_CONTENT_TYPE,
             )
@@ -508,8 +508,17 @@ impl RelayClient {
                     &submission_with_metadata.submission,
                 ))
             } else {
+                match &submission_with_metadata.submission {
+                    SubmitBlockRequest::DenebWithProofs(_)
+                    | SubmitBlockRequest::ElectraWithProofs(_) => {
+                        url.set_path("/relay/v1/builder/blocks_with_proofs");
+                    }
+                    _ => {}
+                };
                 serde_json::to_vec(&submission_with_metadata.submission)
             };
+
+            info!("json block {:?}", json_result);
 
             (
                 json_result.map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?,
