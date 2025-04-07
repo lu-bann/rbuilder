@@ -487,15 +487,15 @@ impl RelayClient {
             (
                 match &submission_with_metadata.submission {
                     SubmitBlockRequest::Capella(data) => data.0.as_ssz_bytes(),
-                    SubmitBlockRequest::Deneb(data) => data.0.as_ssz_bytes(),
+                    SubmitBlockRequest::Deneb(data) => data.as_ssz_bytes(),
                     SubmitBlockRequest::DenebWithProofs(data) => {
                         url.set_path("/relay/v1/builder/blocks_with_proofs");
-                        data.0.inner.as_ssz_bytes()
+                        data.as_ssz_bytes()
                     }
                     SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
                     SubmitBlockRequest::ElectraWithProofs(data) => {
                         url.set_path("/relay/v1/builder/blocks_with_proofs");
-                        data.0.inner.as_ssz_bytes()
+                        data.as_ssz_bytes()
                     }
 
                 },

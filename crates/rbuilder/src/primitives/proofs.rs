@@ -76,7 +76,7 @@ pub enum ProofError {
 }
 
 /// InclusionProof is a Merkle Multiproof of inclusion of a set of TransactionHashes
-#[derive(Debug, Clone, PartialEq, SimpleSerialize, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serializable, serde::Serialize, serde::Deserialize)]
 pub struct InclusionProofs {
     pub transaction_hashes: List<Bytes32, MAX_CONSTRAINTS_PER_SLOT>,
     pub generalized_indexes: List<u64, MAX_CONSTRAINTS_PER_SLOT>,
@@ -87,6 +87,10 @@ impl InclusionProofs {
     /// Returns the total number of leaves in the tree.
     pub fn total_leaves(&self) -> usize {
         self.transaction_hashes.len()
+    }
+
+    pub fn as_ssz_bytes(&self) -> Vec<u8> {
+        ssz_rs::serialize(self).unwrap()
     }
 }
 

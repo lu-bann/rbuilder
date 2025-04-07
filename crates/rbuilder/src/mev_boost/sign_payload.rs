@@ -1,5 +1,5 @@
 use super::submission::{
-    CapellaSubmitBlockRequest, DenebSubmitBlockRequest, DenebSubmitBlockWithProofsRequest,
+    CapellaSubmitBlockRequest, DenebSubmitBlockRequest, DenebSubmitBlockRequestWithProofs,
     ElectraSubmitBlockRequest, ElectraSubmitBlockRequestWithProofs,
     SignedBidSubmissionV3WithProofs, SignedBidSubmissionV4WithProofs, SubmitBlockRequest,
 };
@@ -202,18 +202,14 @@ pub fn sign_block_for_relay(
         let execution_requests =
             ExecutionRequestsV4::try_from(Requests::new(execution_requests.to_vec()))?;
         if chain_spec.is_prague_active_at_timestamp(sealed_block.timestamp) {
-            let inner = SignedBidSubmissionV4 {
-                message,
-                execution_payload,
-                blobs_bundle,
-                signature,
-                execution_requests,
-            };
-
             if inclusion_proofs.is_some() {
                 let request = SubmitBlockRequest::ElectraWithProofs(
                     ElectraSubmitBlockRequestWithProofs(SignedBidSubmissionV4WithProofs {
-                        inner,
+                        message,
+                        execution_payload,
+                        blobs_bundle,
+                        signature,
+                        execution_requests,
                         proofs: inclusion_proofs.unwrap(),
                     }),
                 );
@@ -223,7 +219,14 @@ pub fn sign_block_for_relay(
                 );
                 request
             } else {
-                let request = SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(inner));
+                let request =
+                    SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(SignedBidSubmissionV4 {
+                        message,
+                        execution_payload,
+                        blobs_bundle,
+                        signature,
+                        execution_requests,
+                    }));
                 debug!(
                     submission_request = ?request,
                     "ElectraSubmitBlockRequest"
@@ -231,22 +234,23 @@ pub fn sign_block_for_relay(
                 request
             }
         } else {
-            let inner = SignedBidSubmissionV3 {
-                message,
-                execution_payload,
-                blobs_bundle,
-                signature,
-            };
-
             if inclusion_proofs.is_some() {
-                SubmitBlockRequest::DenebWithProofs(DenebSubmitBlockWithProofsRequest(
+                SubmitBlockRequest::DenebWithProofs(DenebSubmitBlockRequestWithProofs(
                     SignedBidSubmissionV3WithProofs {
-                        inner,
+                        message,
+                        execution_payload,
+                        blobs_bundle,
+                        signature,
                         proofs: inclusion_proofs.unwrap(),
                     },
                 ))
             } else {
-                SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(inner))
+                SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(SignedBidSubmissionV3 {
+                    message,
+                    execution_payload,
+                    blobs_bundle,
+                    signature,
+                }))
             }
         }
     } else {

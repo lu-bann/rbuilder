@@ -85,11 +85,11 @@ impl ValidationAPIClient {
             SubmitBlockRequest::Capella(_) => req.clone(),
             SubmitBlockRequest::Deneb(_) => req.clone(),
             SubmitBlockRequest::DenebWithProofs(req) => {
-                SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(req.0.inner.clone()))
+                SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(req.0.clone().into()))
             }
             SubmitBlockRequest::Electra(_) => req.clone(),
             SubmitBlockRequest::ElectraWithProofs(req) => {
-                SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(req.0.inner.clone()))
+                SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(req.0.clone().into()))
             }
         };
         let request = ValidRequest {
