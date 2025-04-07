@@ -23,7 +23,6 @@ use crate::{
     utils::NonceCache,
 };
 use ahash::{HashMap, HashSet};
-use alloy_primitives::hex::FromHex;
 use derivative::Derivative;
 use reth::revm::cached::CachedReads;
 use reth_provider::StateProvider;
@@ -370,7 +369,7 @@ impl OrderingBuilderContext {
 
                 let start_time = Instant::now();
                 let tx = TransactionSignedEcRecoveredWithBlobs::decode_enveloped_with_real_blobs(
-                    alloy_primitives::Bytes::from_hex(tx)?,
+                    alloy_primitives::Bytes::from(tx.to_vec()),
                 )?;
                 let tx_hash = tx.internal_tx_unsecure().hash().to_string();
                 let commit_result = block_building_helper.commit_constraint(&tx)?;
