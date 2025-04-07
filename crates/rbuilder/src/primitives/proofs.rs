@@ -117,6 +117,10 @@ pub fn generate_inclusion_proofs(
     constraints: &Vec<SignedConstraints>,
     verify_proof: bool,
 ) -> Result<InclusionProofs, ProofError> {
+    let payload_transactions: Vec<TxEnvelope> = payload_transactions
+        .into_iter()
+        .map(|tx_signed| tx_signed.into())
+        .collect();
     info!(
         num_of_txs = payload_transactions.len(),
         "Generating inclusion proofs"
