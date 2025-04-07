@@ -30,6 +30,7 @@ impl ElectraSubmitBlockRequestWithProofs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub struct SignedBidSubmissionV4WithProofs {
     pub message: BidTrace,
     pub execution_payload: ExecutionPayloadV3,
