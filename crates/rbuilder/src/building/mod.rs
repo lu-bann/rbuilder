@@ -1,21 +1,3 @@
-pub mod block_orders;
-pub mod builders;
-pub mod built_block_trace;
-#[cfg(test)]
-pub mod conflict;
-pub mod evm_inspector;
-pub mod fmt;
-pub mod order_commit;
-pub mod payout_tx;
-pub mod sim;
-pub mod testing;
-pub mod tracers;
-use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
-use alloy_primitives::{Address, Bytes, U256};
-use builders::mock_block_building_helper::MockRootHasher;
-use reth_primitives::BlockBody;
-use reth_primitives_traits::{proofs, Block as _};
-
 use crate::{
     live_builder::{block_list_provider::BlockList, payload_events::InternalPayloadId},
     primitives::{
@@ -23,8 +5,13 @@ use crate::{
     },
     provider::RootHasher,
     roothash::RootHashError,
-    utils::{a2r_withdrawal, default_cfg_env, timestamp_as_u64, Signer},
+    utils::{
+        a2r_withdrawal, default_cfg_env, elapsed_ms,
+        receipts::{calculate_receipt_root_and_block_logs_bloom, BloomCache},
+        timestamp_as_u64, Signer,
+    },
 };
+use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::{
     eip1559::{calculate_block_gas_limit, ETHEREUM_BLOCK_GAS_LIMIT_30M},
     eip4844::BlobTransactionSidecar,
@@ -34,21 +21,24 @@ use alloy_eips::{
     merge::BEACON_NONCE,
 };
 use alloy_evm::{block::system_calls::SystemCaller, env::EvmEnv, eth::eip6110};
-use alloy_primitives::B256;
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_beacon::events::PayloadAttributesEvent;
+use cached_reads::{LocalCachedReads, SharedCachedReads};
+use evm::EthCachedEvmFactory;
 use jsonrpsee::core::Serialize;
 use reth::{
     payload::PayloadId,
     primitives::{Block, Receipt, SealedBlock},
     providers::ExecutionOutcome,
-    revm::cached::CachedReads,
 };
-use reth_chainspec::{ChainSpec, EthereumHardforks};
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError, ProviderError};
-use reth_evm::{ConfigureEvm, EthEvmFactory, NextBlockEnvAttributes};
+use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_evm_ethereum::{revm_spec_by_timestamp_and_block_number, EthEvmConfig};
 use reth_node_api::{EngineApiMessageVersion, PayloadBuilderAttributes};
 use reth_payload_builder::EthPayloadBuilderAttributes;
+use reth_primitives::BlockBody;
+use reth_primitives_traits::{proofs, Block as _};
 use revm::{
     context::BlockEnv,
     context_interface::{block::BlobExcessGasAndPrice, result::InvalidTransaction},
@@ -65,22 +55,42 @@ use std::{
 };
 use thiserror::Error;
 use time::OffsetDateTime;
+use tracing::trace;
+use tx_sim_cache::TxExecutionCache;
 
-use self::tracers::SimulationTracer;
-pub use block_orders::*;
-pub use built_block_trace::*;
+pub mod block_orders;
+pub mod builders;
+pub mod built_block_trace;
+pub mod cached_reads;
+#[cfg(test)]
+pub mod conflict;
+pub mod evm;
+pub mod evm_inspector;
+pub mod fmt;
+pub mod order_commit;
+pub mod payout_tx;
+pub mod precompile_cache;
+pub mod sim;
+pub mod testing;
+pub mod tracers;
+pub mod tx_sim_cache;
+
+pub use self::{
+    block_orders::*, builders::mock_block_building_helper::MockRootHasher, built_block_trace::*,
+    order_commit::*, payout_tx::*, sim::simulate_order, tracers::SimulationTracer,
+};
+
 #[cfg(test)]
 pub use conflict::*;
-pub use order_commit::*;
-pub use payout_tx::*;
-pub use sim::simulate_order;
 
 #[derive(Debug, Clone)]
 pub struct BlockBuildingContext {
-    pub evm_factory: EthEvmFactory,
+    pub evm_factory: EthCachedEvmFactory,
     pub evm_env: EvmEnv,
     pub attributes: EthPayloadBuilderAttributes,
     pub chain_spec: Arc<ChainSpec>,
+    /// cached chain_spec.blob_params_at_timestamp(attributes.timestamp()).max_blob_gas_per_block()
+    max_blob_gas_per_block: u64,
     /// Signer to sign builder payoffs (end of block and mev-share).
     /// Is Option to avoid any possible bug (losing money!) with payoffs.
     /// None: coinbase = attributes.suggested_fee_recipient. No payoffs allowed.
@@ -94,6 +104,8 @@ pub struct BlockBuildingContext {
     pub spec_id: SpecId,
     pub root_hasher: Arc<dyn RootHasher>,
     pub payload_id: InternalPayloadId,
+    pub shared_cached_reads: Arc<SharedCachedReads>,
+    pub tx_execution_cache: Arc<TxExecutionCache>,
 }
 
 impl BlockBuildingContext {
@@ -111,6 +123,7 @@ impl BlockBuildingContext {
         spec_id: Option<SpecId>,
         root_hasher: Arc<dyn RootHasher>,
         payload_id: InternalPayloadId,
+        evm_caching_enable: bool,
     ) -> Option<BlockBuildingContext> {
         let attributes = EthPayloadBuilderAttributes::try_new(
             attributes.data.parent_block_hash,
@@ -165,8 +178,10 @@ impl BlockBuildingContext {
                 parent.number + 1,
             )
         });
+        let max_blob_gas_per_block =
+            Self::max_blob_gas_per_block_at(&chain_spec, attributes.timestamp());
         Some(BlockBuildingContext {
-            evm_factory: EthEvmFactory::default(),
+            evm_factory: EthCachedEvmFactory::default(),
             evm_env,
             attributes,
             chain_spec,
@@ -177,7 +192,17 @@ impl BlockBuildingContext {
             spec_id,
             root_hasher,
             payload_id,
+            shared_cached_reads: Default::default(),
+            tx_execution_cache: Arc::new(TxExecutionCache::new(evm_caching_enable)),
+            max_blob_gas_per_block,
         })
+    }
+
+    fn max_blob_gas_per_block_at(chain_spec: &ChainSpec, timestamp: u64) -> u64 {
+        chain_spec
+            .blob_params_at_timestamp(timestamp)
+            .map(|params| params.max_blob_gas_per_block())
+            .unwrap_or(0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -193,6 +218,7 @@ impl BlockBuildingContext {
         suggested_fee_recipient: Address,
         builder_signer: Option<Signer>,
         root_hasher: Arc<dyn RootHasher>,
+        evm_caching_enable: bool,
     ) -> BlockBuildingContext {
         let block_number = onchain_block.header.number;
 
@@ -248,8 +274,10 @@ impl BlockBuildingContext {
                 onchain_block.header.number,
             )
         });
+        let max_blob_gas_per_block =
+            Self::max_blob_gas_per_block_at(&chain_spec, attributes.timestamp());
         BlockBuildingContext {
-            evm_factory: EthEvmFactory::default(),
+            evm_factory: EthCachedEvmFactory::default(),
             evm_env,
             attributes,
             chain_spec,
@@ -260,9 +288,15 @@ impl BlockBuildingContext {
             spec_id,
             root_hasher,
             payload_id: 0,
+            shared_cached_reads: Default::default(),
+            tx_execution_cache: Arc::new(TxExecutionCache::new(evm_caching_enable)),
+            max_blob_gas_per_block,
         }
     }
 
+    pub fn max_blob_gas_per_block(&self) -> u64 {
+        self.max_blob_gas_per_block
+    }
     /// Useless BlockBuildingContext for testing in contexts where we can't avoid having a BlockBuildingContext.
     pub fn dummy_for_testing() -> Self {
         let mut onchain_block: alloy_rpc_types::Block = Default::default();
@@ -276,6 +310,7 @@ impl BlockBuildingContext {
             Default::default(),
             Default::default(),
             Arc::new(MockRootHasher {}),
+            false,
         )
     }
 
@@ -296,6 +331,18 @@ impl BlockBuildingContext {
     pub fn coinbase_is_suggested_fee_recipient(&self) -> bool {
         self.evm_env.block_env.beneficiary == self.attributes.suggested_fee_recipient
     }
+}
+
+/// This context should be owned by one thread for the duration of the slot.
+/// For example, copy of this should be owned by each builder thread, top of block simulation, finalization thread.
+///
+/// Its important to not reuse this cache from one payload job to another.
+///
+/// Caches shared between threads should go to BlockBuildingContext.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadBlockBuildingContext {
+    pub cached_reads: LocalCachedReads,
+    pub bloom_cache: BloomCache,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -402,7 +449,7 @@ pub enum InsertPayoutTxErr {
     NoSigner,
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum ExecutionError {
     #[error("Order error: {0}")]
     OrderError(#[from] OrderErr),
@@ -442,7 +489,6 @@ impl ExecutionError {
 
 pub struct FinalizeResult {
     pub sealed_block: SealedBlock,
-    pub cached_reads: CachedReads,
     // sidecars for all txs in SealedBlock
     pub txs_blob_sidecars: Vec<Arc<BlobTransactionSidecar>>,
     /// The Pectra execution requests for this bid.
@@ -504,6 +550,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         &mut self,
         order: &SimulatedOrder,
         ctx: &BlockBuildingContext,
+        local_ctx: &mut ThreadBlockBuildingContext,
         state: &mut BlockState,
         result_filter: &dyn Fn(&SimValue) -> Result<(), ExecutionError>,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
@@ -514,11 +561,10 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             ))));
         }
 
-        let mut fork = PartialBlockFork::new(state).with_tracer(&mut self.tracer);
+        let mut fork = PartialBlockFork::new(state, ctx, local_ctx).with_tracer(&mut self.tracer);
         let rollback = fork.rollback_point();
         let exec_result = fork.commit_order(
             &order.order,
-            ctx,
             self.gas_used,
             self.gas_reserved,
             self.blob_gas_used,
@@ -568,6 +614,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         &mut self,
         constraint: &TransactionSignedEcRecoveredWithBlobs,
         ctx: &BlockBuildingContext,
+        local_ctx: &mut ThreadBlockBuildingContext,
         state: &mut BlockState,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
         if ctx.builder_signer.is_none() {
@@ -580,10 +627,9 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         // Wrap the constraint in a MempoolTx
         let order = Order::Tx(MempoolTx::new(constraint.clone()));
 
-        let mut fork = PartialBlockFork::new(state).with_tracer(&mut self.tracer);
+        let mut fork = PartialBlockFork::new(state, ctx, local_ctx).with_tracer(&mut self.tracer);
         let exec_result = fork.commit_order(
             &order,
-            ctx,
             self.gas_used,
             self.gas_reserved,
             self.blob_gas_used,
@@ -639,6 +685,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         gas_limit: u64,
         value: U256,
         ctx: &BlockBuildingContext,
+        local_ctx: &mut ThreadBlockBuildingContext,
         state: &mut BlockState,
     ) -> Result<(), InsertPayoutTxErr> {
         let builder_signer = ctx
@@ -647,7 +694,11 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             .ok_or(InsertPayoutTxErr::NoSigner)?;
         self.free_reserved_gas();
         let nonce = state
-            .nonce(builder_signer.address)
+            .nonce(
+                builder_signer.address,
+                &ctx.shared_cached_reads,
+                &mut local_ctx.cached_reads,
+            )
             .map_err(CriticalCommitOrderError::Reth)?;
         let tx = create_payout_tx(
             ctx.chain_spec.as_ref(),
@@ -660,8 +711,8 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         )?;
         // payout tx has no blobs so it's safe to unwrap
         let tx = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap();
-        let mut fork = PartialBlockFork::new(state).with_tracer(&mut self.tracer);
-        let exec_result = fork.commit_tx(&tx, ctx, self.gas_used, 0, self.blob_gas_used)?;
+        let mut fork = PartialBlockFork::new(state, ctx, local_ctx).with_tracer(&mut self.tracer);
+        let exec_result = fork.commit_tx(&tx, self.gas_used, 0, self.blob_gas_used)?;
         let ok_result = exec_result?;
         if !ok_result.receipt.success {
             return Err(InsertPayoutTxErr::PayoutTxReverted);
@@ -680,8 +731,9 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         &self,
         state: &mut BlockState,
         ctx: &BlockBuildingContext,
+        local_ctx: &mut ThreadBlockBuildingContext,
     ) -> Result<(Option<Requests>, Option<B256>), FinalizeError> {
-        let mut db = state.new_db_ref();
+        let mut db = state.new_db_ref(&ctx.shared_cached_reads, &mut local_ctx.cached_reads);
 
         // Apply and gather execution requests
         let requests = if ctx
@@ -740,14 +792,22 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
     #[allow(clippy::too_many_arguments)]
     pub fn finalize(
         self,
-        state: &mut BlockState,
+        mut state: BlockState,
         ctx: &BlockBuildingContext,
+        local_ctx: &mut ThreadBlockBuildingContext,
     ) -> Result<FinalizeResult, FinalizeError> {
-        let (requests, withdrawals_root) = self.process_requests(state, ctx)?;
-        let (cached_reads, bundle) = state.clone_bundle_and_cache();
+        let start = Instant::now();
+
+        let step_start = Instant::now();
+        let (requests, withdrawals_root) = self.process_requests(&mut state, ctx, local_ctx)?;
         let block_number = ctx.evm_env.block_env.number;
 
+        let request_processsing_time_ms = elapsed_ms(step_start);
+        let step_start = Instant::now();
+
         let requests_hash = requests.as_ref().map(|requests| requests.requests_hash());
+
+        let (bundle, _) = state.into_parts();
         let execution_outcome = ExecutionOutcome::new(
             bundle,
             vec![self.receipts],
@@ -755,21 +815,29 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             vec![requests.clone().unwrap_or_default()],
         );
 
-        // @TODO: Check ethereum_receipts_root since it could fail on Op. Check reth crates/optimism/payload/src/builder.rs?
-        let receipts_root = execution_outcome
-            .ethereum_receipts_root(block_number)
-            .expect("Number is in range");
-        let logs_bloom = execution_outcome
-            .block_logs_bloom(block_number)
-            .expect("Number is in range");
+        let exec_outcome_time_ms = elapsed_ms(step_start);
+        let step_start = Instant::now();
+
+        let (receipts_root, logs_bloom) = calculate_receipt_root_and_block_logs_bloom(
+            execution_outcome.receipts_by_block(block_number),
+            &mut local_ctx.bloom_cache,
+        );
+
+        let bloom_time_ms = elapsed_ms(step_start);
+        let step_start = Instant::now();
 
         // calculate the state root
-        let start = Instant::now();
         let state_root = ctx.root_hasher.state_root(&execution_outcome)?;
-        let root_hash_time = start.elapsed();
+        let root_hash_time = step_start.elapsed();
+
+        let root_hash_time_ms = elapsed_ms(step_start);
+        let step_start = Instant::now();
 
         // create the block header
         let transactions_root = proofs::calculate_transaction_root(&self.executed_tx);
+
+        let transactions_root_time_ms = elapsed_ms(step_start);
+        let step_start = Instant::now();
 
         // double check blocked txs
         for tx_with_blob in &self.executed_tx {
@@ -799,6 +867,9 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         } else {
             (None, None)
         };
+
+        let blobs_time_ms = elapsed_ms(step_start);
+        let step_start = Instant::now();
 
         let header = Header {
             parent_hash: ctx.attributes.parent,
@@ -842,22 +913,39 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
                 withdrawals,
             },
         };
-
-        Ok(FinalizeResult {
+        let result = FinalizeResult {
             sealed_block: block.seal_slow(),
-            cached_reads,
             txs_blob_sidecars,
             root_hash_time,
             execution_requests: requests.map(|er| er.take()).unwrap_or_default(),
-        })
+        };
+
+        let block_seal_time_ms = elapsed_ms(step_start);
+
+        let total_time_ms = elapsed_ms(start);
+
+        trace!(
+            total_time_ms,
+            exec_outcome_time_ms,
+            bloom_time_ms,
+            request_processsing_time_ms,
+            root_hash_time_ms,
+            transactions_root_time_ms,
+            blobs_time_ms,
+            block_seal_time_ms,
+            "Partial block finalized block"
+        );
+
+        Ok(result)
     }
 
     pub fn pre_block_call(
         &mut self,
         ctx: &BlockBuildingContext,
+        local_ctx: &mut ThreadBlockBuildingContext,
         state: &mut BlockState,
     ) -> eyre::Result<()> {
-        let mut db = state.new_db_ref();
+        let mut db = state.new_db_ref(&ctx.shared_cached_reads, &mut local_ctx.cached_reads);
         let mut system_caller = SystemCaller::new(ctx.chain_spec.clone());
         let mut evm = EthEvmConfig::new(ctx.chain_spec.clone())
             .evm_with_env(db.as_mut(), ctx.evm_env.clone());

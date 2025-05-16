@@ -10,7 +10,7 @@ use alloy_primitives::utils::format_ether;
 
 use crate::{
     backtest::{
-        execute::{backtest_prepare_ctx_for_block_from_building_context, BacktestBlockInput},
+        execute::{backtest_prepare_orders_from_building_context, BacktestBlockInput},
         OrdersWithTimestamp,
     },
     building::{builders::BacktestSimulateBlockInput, BlockBuildingContext},
@@ -86,10 +86,8 @@ where
     orders_source.print_custom_stats(provider_factory.clone())?;
 
     let ctx = orders_source.create_block_building_context()?;
-    let BacktestBlockInput {
-        ctx, sim_orders, ..
-    } = backtest_prepare_ctx_for_block_from_building_context(
-        ctx,
+    let BacktestBlockInput { sim_orders, .. } = backtest_prepare_orders_from_building_context(
+        ctx.clone(),
         available_orders.clone(),
         provider_factory.clone(),
         &config.base_config().sbundle_mergeable_signers(),
@@ -117,14 +115,13 @@ where
                     builder_name: builder_name.clone(),
                     sim_orders: &sim_orders,
                     provider: provider_factory.clone(),
-                    cached_reads: None,
                 };
                 let build_res = config.build_backtest_block(builder_name, input);
                 if let Err(err) = &build_res {
                     println!("Error building block: {:?}", err);
                     return None;
                 }
-                let (block, _) = build_res.ok()?;
+                let block = build_res.ok()?;
                 println!(
                     "Built block {} with builder: {:?}",
                     ctx.block(),

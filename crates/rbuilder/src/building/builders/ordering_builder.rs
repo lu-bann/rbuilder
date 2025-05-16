@@ -12,7 +12,7 @@ use crate::{
             block_building_helper::BlockBuildingHelper, LiveBuilderInput, OrderIntakeConsumer,
         },
         BlockBuildingContext, ExecutionError, OrderPriority, PrioritizedOrderStore,
-        SimulatedOrderSink, Sorting,
+        SimulatedOrderSink, Sorting, ThreadBlockBuildingContext,
     },
     primitives::{
         constraints::SignedConstraints, AccountNonce, OrderId, SimValue,
@@ -24,7 +24,6 @@ use crate::{
 };
 use ahash::{HashMap, HashSet};
 use derivative::Derivative;
-use reth::revm::cached::CachedReads;
 use reth_provider::StateProvider;
 use serde::Deserialize;
 use std::{
@@ -45,8 +44,8 @@ use super::{
 #[serde(deny_unknown_fields)]
 pub struct OrderingBuilderConfig {
     /// If a tx inside a bundle or sbundle fails with TransactionErr (don't confuse this with reverting which is TransactionOk with !.receipt.success)
-    /// and it's configured as allowed to revert (for bundles tx in reverting_tx_hashes, for sbundles: TxRevertBehavior != NotAllowed) we continue the
-    /// the execution of the bundle/sbundle
+    /// and it's configured as allowed to revert (for bundles tx in reverting_tx_hashes or dropping_tx_hashes, for sbundles: TxRevertBehavior != NotAllowed)
+    /// we continue the  execution of the bundle/sbundle. The most typical value is true.
     pub discard_txs: bool,
     pub sorting: Sorting,
     /// Only when a tx fails because the profit was worst than expected: Number of time an order can fail during a single block building iteration.
@@ -184,7 +183,7 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
 pub fn backtest_simulate_block<P, OrderPriorityType: OrderPriority>(
     ordering_config: OrderingBuilderConfig,
     input: BacktestSimulateBlockInput<'_, P>,
-) -> eyre::Result<(Block, CachedReads)>
+) -> eyre::Result<Block>
 where
     P: StateProviderFactory + Clone + 'static,
 {
@@ -194,13 +193,13 @@ where
         .history_by_block_number(input.ctx.evm_env.block_env.number - 1)?;
     let block_orders =
         block_orders_from_sim_orders::<OrderPriorityType>(input.sim_orders, &state_provider)?;
+    let mut local_ctx = ThreadBlockBuildingContext::default();
     let mut builder = OrderingBuilderContext::new(
         Arc::from(state_provider),
         input.builder_name,
         input.ctx.clone(),
         ordering_config,
-    )
-    .with_cached_reads(input.cached_reads.unwrap_or_default());
+    );
     let block_builder = builder.build_block(
         block_orders,
         use_suggested_fee_recipient_as_coinbase,
@@ -212,11 +211,9 @@ where
     } else {
         Some(block_builder.true_block_value()?)
     };
-    let finalize_block_result = block_builder.finalize_block(payout_tx_value, None)?;
-    Ok((
-        finalize_block_result.block,
-        finalize_block_result.cached_reads,
-    ))
+    let finalize_block_result =
+        block_builder.finalize_block(&mut local_ctx, payout_tx_value, None)?;
+    Ok(finalize_block_result.block)
 }
 
 #[derive(Derivative)]
@@ -229,7 +226,7 @@ pub struct OrderingBuilderContext {
     config: OrderingBuilderConfig,
 
     // caches
-    cached_reads: Option<CachedReads>,
+    local_ctx: ThreadBlockBuildingContext,
 
     // scratchpad
     failed_orders: HashSet<OrderId>,
@@ -247,22 +244,11 @@ impl OrderingBuilderContext {
             state,
             builder_name,
             ctx,
+            local_ctx: Default::default(),
             config,
-            cached_reads: None,
             failed_orders: HashSet::default(),
             order_attempts: HashMap::default(),
         }
-    }
-
-    pub fn with_cached_reads(self, cached_reads: CachedReads) -> Self {
-        Self {
-            cached_reads: Some(cached_reads),
-            ..self
-        }
-    }
-
-    pub fn take_cached_reads(&mut self) -> Option<CachedReads> {
-        self.cached_reads.take()
     }
 
     /// use_suggested_fee_recipient_as_coinbase: all the mev profit goes directly to the slot suggested_fee_recipient so we avoid the payout tx.
@@ -291,7 +277,7 @@ impl OrderingBuilderContext {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             self.state.clone(),
             new_ctx,
-            self.cached_reads.take(),
+            &mut self.local_ctx,
             self.builder_name.clone(),
             self.config.discard_txs,
             cancel_block,
@@ -299,7 +285,6 @@ impl OrderingBuilderContext {
 
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
-        self.cached_reads = Some(block_building_helper.clone_cached_reads());
         Ok(Box::new(block_building_helper))
     }
 
@@ -310,7 +295,7 @@ impl OrderingBuilderContext {
         cancel_block: CancellationToken,
         slot_constraints: Vec<SignedConstraints>,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
-        info!("build_blocks_with_constraintss");
+        info!("build_blocks_with_constraints");
         let build_attempt_id: u32 = rand::random();
         let span = info_span!("build_run", build_attempt_id);
         let _guard = span.enter();
@@ -328,7 +313,7 @@ impl OrderingBuilderContext {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             self.state.clone(),
             new_ctx,
-            self.cached_reads.take(),
+            &mut self.local_ctx,
             self.builder_name.clone(),
             self.config.discard_txs,
             cancel_block,
@@ -346,7 +331,6 @@ impl OrderingBuilderContext {
         // Then fill the remaining orders
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
-        self.cached_reads = Some(block_building_helper.clone_cached_reads());
         info!("Finish build_blocks_with_constraints");
         Ok(Box::new(block_building_helper))
     }
@@ -372,7 +356,8 @@ impl OrderingBuilderContext {
                     alloy_primitives::Bytes::from(tx.to_vec()),
                 )?;
                 let tx_hash = tx.internal_tx_unsecure().hash().to_string();
-                let commit_result = block_building_helper.commit_constraint(&tx)?;
+                let commit_result =
+                    block_building_helper.commit_constraint(&mut self.local_ctx, &tx)?;
                 let order_commit_time = start_time.elapsed();
                 let mut gas_used = 0;
                 let mut execution_error = None;
@@ -421,6 +406,12 @@ impl OrderingBuilderContext {
         let mut order_attempts: HashMap<OrderId, usize> = HashMap::default();
         // @Perf when gas left is too low we should break.
         while let Some(sim_order) = block_orders.pop_order() {
+            // @Todo we drop such bundles instead of failing simulation for them
+            // because share bundle merging depends on allowing no txs bundles into the block
+            if sim_order.sim_value.gas_used == 0 {
+                continue;
+            }
+
             if let Some(deadline) = self.config.build_duration_deadline() {
                 if build_start.elapsed() > deadline {
                     break;
@@ -432,9 +423,13 @@ impl OrderingBuilderContext {
                 block_building_helper.builder_name(),
             );
             let start_time = Instant::now();
-            let commit_result = block_building_helper.commit_order(&sim_order, &|sim_result| {
-                simulation_too_low::<OrderPriorityType>(&sim_order.sim_value, sim_result)
-            })?;
+            let commit_result = block_building_helper.commit_order(
+                &mut self.local_ctx,
+                &sim_order,
+                &|sim_result| {
+                    simulation_too_low::<OrderPriorityType>(&sim_order.sim_value, sim_result)
+                },
+            )?;
             let order_commit_time = start_time.elapsed();
             let mut gas_used = 0;
             let mut execution_error = None;

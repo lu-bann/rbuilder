@@ -9,6 +9,7 @@ use crate::{
     primitives::{
         mev_boost::{MevBoostRelayBidSubmitter, MevBoostRelayID},
         proofs::generate_inclusion_proofs,
+        Order,
     },
     telemetry::{
         add_relay_submit_time, add_subsidy_value, inc_conn_relay_errors,
@@ -16,7 +17,7 @@ use crate::{
         inc_relay_accepted_submissions, inc_subsidized_blocks, inc_too_many_req_relay_errors,
         mark_submission_start_time,
     },
-    utils::error_storage::store_error_event,
+    utils::{duration_ms, error_storage::store_error_event},
 };
 use ahash::HashMap;
 use alloy_primitives::{utils::format_ether, U256};
@@ -26,7 +27,7 @@ use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info_span, trace, warn, Instrument};
+use tracing::{debug, error, info, info_span, trace, warn, Instrument, Span};
 
 use super::{
     bid_observer::BidObserver,
@@ -104,6 +105,8 @@ pub struct SubmissionConfig {
 
     pub optimistic_config: Option<OptimisticConfig>,
     pub bid_observer: Box<dyn BidObserver + Send + Sync>,
+    /// Bids above this value will only go to independent relays.
+    pub independent_bid_threshold: U256,
 }
 
 /// Configuration for optimistic block submission to relays.
@@ -156,11 +159,18 @@ async fn run_submit_to_relays_job(
 
     let mut last_bid_hash = None;
     'submit: loop {
-        if cancel.is_cancelled() {
-            break 'submit res;
-        }
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!(
+                    block = slot_data.block(),
+                    "run_submit_to_relays_job cancelled"
+                );
+                break 'submit res;
+            },
+            _ = pending_bid.wait_for_change() => {
+            }
+        };
 
-        pending_bid.wait_for_change().await;
         let block = if let Some(new_block) = pending_bid.take_pending_block() {
             if last_bid_hash
                 .is_none_or(|last_bid_hash| last_bid_hash != new_block.sealed_block.hash())
@@ -249,14 +259,18 @@ async fn run_submit_to_relays_job(
             txs = block.sealed_block.body().transactions.len(),
             bundles,
             builder_name = block.builder_name,
-            fill_time_ms = block.trace.fill_time.as_millis(),
-            finalize_time_ms = block.trace.finalize_time.as_millis(),
+            fill_time_ms = duration_ms(block.trace.fill_time),
+            finalize_time_ms = duration_ms(block.trace.finalize_time),
         );
-        debug!(
+        info!(
             parent: &submission_span,
             "Submitting bid",
         );
-        inc_initiated_submissions(optimistic_config.is_some());
+        let relay_filter = get_relay_filter_and_update_metrics(
+            &block,
+            optimistic_config.is_some(),
+            config.independent_bid_threshold,
+        );
 
         let (normal_signed_submission, optimistic_signed_submission) = {
             let normal_signed_submission = match sign_block_for_relay(
@@ -312,59 +326,105 @@ async fn run_submit_to_relays_job(
         };
 
         mark_submission_start_time(block.trace.orders_sealed_at);
-
-        for relay in &normal_relays {
-            let span = info_span!(parent: &submission_span, "relay_submit", relay = &relay.id(), optimistic = false);
-            let relay = relay.clone();
-            let cancel = cancel.clone();
-            let submission = normal_signed_submission.clone();
-            tokio::spawn(
-                async move {
-                    submit_bid_to_the_relay(&relay, cancel.clone(), submission, false).await;
-                }
-                .instrument(span),
-            );
-        }
+        submit_block_to_relays(
+            &normal_relays,
+            &normal_signed_submission,
+            &relay_filter,
+            false,
+            &submission_span,
+            &cancel,
+        );
 
         if let Some((optimistic_signed_submission, _)) = &optimistic_signed_submission {
-            for relay in &optimistic_relays {
-                let span = info_span!(parent: &submission_span, "relay_submit", relay = &relay.id(), optimistic = true);
-                let relay = relay.clone();
-                let cancel = cancel.clone();
-                let submission = optimistic_signed_submission.clone();
-                tokio::spawn(
-                    async move {
-                        submit_bid_to_the_relay(&relay, cancel.clone(), submission, true).await;
-                    }
-                    .instrument(span),
-                );
-            }
+            submit_block_to_relays(
+                &optimistic_relays,
+                optimistic_signed_submission,
+                &relay_filter,
+                true,
+                &submission_span,
+                &cancel,
+            );
         } else {
             // non-optimistic submission to optimistic relays
-            for relay in &optimistic_relays {
-                let span = info_span!(parent: &submission_span, "relay_submit", relay = &relay.id(), optimistic = false);
-                let relay = relay.clone();
-                let cancel = cancel.clone();
-                let submission = normal_signed_submission.clone();
-                tokio::spawn(
-                    async move {
-                        submit_bid_to_the_relay(&relay, cancel.clone(), submission, false).await;
-                    }
-                    .instrument(span),
-                );
-            }
+            submit_block_to_relays(
+                &optimistic_relays,
+                &normal_signed_submission,
+                &relay_filter,
+                false,
+                &submission_span,
+                &cancel,
+            );
         }
 
         submission_span.in_scope(|| {
             // NOTE: we only notify normal submission here because they have the same contents but different pubkeys
             config.bid_observer.block_submitted(
-                block.sealed_block,
-                normal_signed_submission.submission,
-                block.trace,
+                &slot_data,
+                &block.sealed_block,
+                &normal_signed_submission.submission,
+                &block.trace,
                 builder_name,
                 bid_metadata.value.top_competitor_bid.unwrap_or_default(),
             );
         })
+    }
+}
+
+fn submit_block_to_relays(
+    relays: &Vec<MevBoostRelayBidSubmitter>,
+    submission: &SubmitBlockRequestWithMetadata,
+    relay_filter: &impl Fn(&MevBoostRelayBidSubmitter) -> bool,
+    optimistic: bool,
+    submission_span: &Span,
+    cancel: &CancellationToken,
+) {
+    for relay in relays {
+        if relay_filter(relay) {
+            let span = info_span!(parent: submission_span, "relay_submit", relay = &relay.id(), optimistic);
+            let relay = relay.clone();
+            let cancel = cancel.clone();
+            let submission = submission.clone();
+            tokio::spawn(
+                async move {
+                    submit_bid_to_the_relay(&relay, cancel.clone(), submission, optimistic).await;
+                }
+                .instrument(span),
+            );
+        }
+    }
+}
+
+/// Creates a Fn to decide if the block should go to a relay.
+/// The cfg defines 2 flags on relays: fast and independent.
+/// If a block has replacement ids it should NOT go to a relay that is not fast since it needs fast cancellations.
+/// If a block is expensive it should NOT go to a non independent relay.
+fn get_relay_filter_and_update_metrics(
+    block: &Block,
+    optimistic: bool,
+    independent_bid_threshold: U256,
+) -> impl Fn(&MevBoostRelayBidSubmitter) -> bool {
+    // only_independent = expensive blocks.
+    let only_independent = block.trace.bid_value > independent_bid_threshold;
+    // only_fast = blocks with replaceable orders.
+    let only_fast = block
+        .trace
+        .included_orders
+        .iter()
+        .flat_map(|exec_res| exec_res.order.original_orders())
+        .any(|o| match o {
+            Order::Bundle(bundle) => bundle.replacement_data.is_some(),
+            Order::Tx(_) => false,
+            Order::ShareBundle(_) => false,
+        });
+    inc_initiated_submissions(optimistic, !only_fast, !only_independent);
+    move |relay: &MevBoostRelayBidSubmitter| {
+        if only_independent && !relay.is_independent() {
+            return false; // Sorry relay but this block is expensive and you are not independent :(
+        }
+        if only_fast && !relay.is_fast() {
+            return false; // Sorry relay but this block contains replacements and you are slow :(
+        }
+        true
     }
 }
 

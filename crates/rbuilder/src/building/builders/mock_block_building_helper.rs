@@ -1,7 +1,7 @@
 use crate::{
     building::{
         BlockBuildingContext, BuiltBlockTrace, CriticalCommitOrderError, ExecutionError,
-        ExecutionResult,
+        ExecutionResult, ThreadBlockBuildingContext,
     },
     live_builder::simulation::SimulatedOrderCommand,
     primitives::{
@@ -12,7 +12,7 @@ use crate::{
     roothash::RootHashError,
 };
 use alloy_primitives::{B256, U256};
-use reth::{providers::ExecutionOutcome, revm::cached::CachedReads};
+use reth::providers::ExecutionOutcome;
 use reth_primitives::SealedBlock;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
@@ -66,6 +66,7 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
 
     fn commit_order(
         &mut self,
+        _local_ctx: &mut ThreadBlockBuildingContext,
         _order: &SimulatedOrder,
         _result_filter: &dyn Fn(&SimValue) -> Result<(), ExecutionError>,
     ) -> Result<Result<&ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
@@ -78,6 +79,7 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
 
     fn commit_constraint(
         &mut self,
+        _local_ctx: &mut ThreadBlockBuildingContext,
         _constraint: &TransactionSignedEcRecoveredWithBlobs,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
         unimplemented!()
@@ -101,6 +103,7 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
 
     fn finalize_block(
         mut self: Box<Self>,
+        _local_ctx: &mut ThreadBlockBuildingContext,
         payout_tx_value: Option<U256>,
         seen_competition_bid: Option<U256>,
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
@@ -119,14 +122,7 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
             execution_requests: Default::default(),
         };
 
-        Ok(FinalizeBlockResult {
-            block,
-            cached_reads: CachedReads::default(),
-        })
-    }
-
-    fn clone_cached_reads(&self) -> CachedReads {
-        CachedReads::default()
+        Ok(FinalizeBlockResult { block })
     }
 
     fn built_block_trace(&self) -> &BuiltBlockTrace {
@@ -135,10 +131,6 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
 
     fn building_context(&self) -> &BlockBuildingContext {
         &self.block_building_context
-    }
-
-    fn update_cached_reads(&mut self, _cached_reads: CachedReads) {
-        unimplemented!()
     }
 
     fn builder_name(&self) -> &str {

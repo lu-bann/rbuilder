@@ -122,14 +122,14 @@ parking_lot.workspace = true
 dashmap = "6.1.0"
 
 # IPC state provider deps
-reipc = { git = "https://github.com/nethermindeth/reipc.git", rev = "8a9c31f7a4b7dfdd828020222ae1ccdff802cbc9" }
+reipc = { git = "https://github.com/nethermindeth/reipc.git", rev = "3837f3539201f948dd1c2c96a85a60d589feb4c6" }
 quick_cache = "0.6.11"
 
 
 reqwest-eventsource = "0.6"
 
 axum = { version = "0.7.9", features = ["macros"] }
-tree_hash = "0.9.1"
+tree_hash = { version = "1.0.0-beta.0" }
 
 [build-dependencies]
 built = { version = "0.7.1", features = ["git2", "chrono"] }

@@ -4,7 +4,6 @@ use super::{
 };
 use ahash::HashMap;
 use alloy_primitives::utils::format_ether;
-use reth::revm::cached::CachedReads;
 use reth_provider::StateProvider;
 use std::{sync::Arc, time::Instant};
 use time::OffsetDateTime;
@@ -19,17 +18,18 @@ use crate::{
             },
             handle_building_error, UnfinishedBlockBuildingSink,
         },
-        BlockBuildingContext,
+        BlockBuildingContext, ThreadBlockBuildingContext,
     },
     telemetry::mark_builder_considers_order,
+    utils::elapsed_ms,
 };
 
 /// Assembles block building results from the best orderings of order groups.
 pub struct BlockBuildingResultAssembler {
     state: Arc<dyn StateProvider>,
     ctx: BlockBuildingContext,
+    pub local_ctx: ThreadBlockBuildingContext,
     cancellation_token: CancellationToken,
-    cached_reads: Option<CachedReads>,
     discard_txs: bool,
     coinbase_payment: bool,
     can_use_suggested_fee_recipient_as_coinbase: bool,
@@ -63,8 +63,8 @@ impl BlockBuildingResultAssembler {
         Self {
             state,
             ctx,
+            local_ctx: Default::default(),
             cancellation_token,
-            cached_reads: None,
             discard_txs: config.discard_txs,
             coinbase_payment: config.coinbase_payment,
             can_use_suggested_fee_recipient_as_coinbase,
@@ -140,7 +140,7 @@ impl BlockBuildingResultAssembler {
                     trace!(
                         run_id = self.run_id,
                         version = version,
-                        time_ms = time_start.elapsed().as_millis(),
+                        time_ms = elapsed_ms(time_start),
                         profit = format_ether(value),
                         "Parallel builder built new block",
                     );
@@ -197,7 +197,7 @@ impl BlockBuildingResultAssembler {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             self.state.clone(),
             ctx,
-            self.cached_reads.clone(),
+            &mut self.local_ctx,
             self.builder_name.clone(),
             self.discard_txs,
             self.cancellation_token.clone(),
@@ -230,7 +230,9 @@ impl BlockBuildingResultAssembler {
                     block_building_helper.builder_name(),
                 );
                 let start_time = Instant::now();
-                let commit_result = block_building_helper.commit_order(sim_order, &|_| Ok(()))?;
+                let commit_result =
+                    block_building_helper
+                        .commit_order(&mut self.local_ctx, sim_order, &|_| Ok(()))?;
                 let order_commit_time = start_time.elapsed();
 
                 let mut gas_used = 0;
@@ -256,19 +258,18 @@ impl BlockBuildingResultAssembler {
             }
         }
         block_building_helper.set_trace_fill_time(build_start.elapsed());
-        self.cached_reads = Some(block_building_helper.clone_cached_reads());
         Ok(Box::new(block_building_helper))
     }
 
     pub fn build_backtest_block(
-        &self,
+        &mut self,
         best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)>,
         orders_closed_at: OffsetDateTime,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             self.state.clone(),
             self.ctx.clone(),
-            None, // No cached reads for backtest start
+            &mut self.local_ctx,
             String::from("backtest_builder"),
             self.discard_txs,
             CancellationToken::new(),
@@ -299,7 +300,9 @@ impl BlockBuildingResultAssembler {
             for (order_idx, _) in sequence_of_orders.sequence_of_orders.iter() {
                 let sim_order = &order_group.orders[*order_idx];
 
-                let commit_result = block_building_helper.commit_order(sim_order, &|_| Ok(()))?;
+                let commit_result =
+                    block_building_helper
+                        .commit_order(&mut self.local_ctx, sim_order, &|_| Ok(()))?;
 
                 match commit_result {
                     Ok(res) => {

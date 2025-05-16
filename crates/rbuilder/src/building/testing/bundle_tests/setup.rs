@@ -4,8 +4,10 @@
 //! test setup is used to build orders and commit them
 use crate::{
     building::{
+        cached_reads::{LocalCachedReads, SharedCachedReads},
         testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
         BlockState, ExecutionError, ExecutionResult, OrderErr, PartialBlock,
+        ThreadBlockBuildingContext,
     },
     primitives::{
         order_builder::OrderBuilder, BundleRefund, BundleReplacementData, OrderId, Refund,
@@ -13,8 +15,9 @@ use crate::{
     },
 };
 use alloy_primitives::{Address, TxHash};
-use reth::revm::cached::CachedReads;
+use reth_provider::StateProvider;
 use revm::database::states::BundleState;
+use std::sync::Arc;
 
 pub enum NonceValue {
     /// Fixed value
@@ -28,7 +31,6 @@ pub struct TestSetup {
     partial_block: PartialBlock<()>,
     order_builder: OrderBuilder,
     bundle_state: Option<BundleState>,
-    cached_reads: Option<CachedReads>,
     test_chain: TestChainState,
 }
 
@@ -38,7 +40,6 @@ impl TestSetup {
             partial_block: PartialBlock::new(true),
             order_builder: OrderBuilder::None,
             bundle_state: None,
-            cached_reads: None,
             test_chain: TestChainState::new(block_args)?,
         })
     }
@@ -210,10 +211,9 @@ impl TestSetup {
         )
     }
     fn try_commit_order(&mut self) -> eyre::Result<Result<ExecutionResult, ExecutionError>> {
-        let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.take().unwrap_or_default())
-            .with_cached_reads(self.cached_reads.take().unwrap_or_default());
+        let state_provider: Arc<dyn StateProvider> =
+            Arc::from(self.test_chain.provider_factory().latest()?);
+        let mut local_ctx = ThreadBlockBuildingContext::default();
 
         let sim_order = SimulatedOrder {
             order: self.order_builder.build_order(),
@@ -221,18 +221,38 @@ impl TestSetup {
             used_state_trace: Default::default(),
         };
 
-        let result = self.partial_block.commit_order(
-            &sim_order,
-            self.test_chain.block_building_context(),
-            &mut block_state,
-            &|_| Ok(()),
-        )?;
+        // we commit order twice to test evm caching
+        let initial_partial_block = self.partial_block.clone();
+        let initial_bundle_state = self.bundle_state.take().unwrap_or_default();
 
-        let (cached_reads, bundle_state, _) = block_state.into_parts();
-        self.cached_reads = Some(cached_reads);
-        self.bundle_state = Some(bundle_state);
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            let mut block_state = BlockState::new_arc(state_provider.clone())
+                .with_bundle_state(initial_bundle_state.clone());
 
-        Ok(result)
+            let mut partial_block = initial_partial_block.clone();
+
+            let result = partial_block.commit_order(
+                &sim_order,
+                self.test_chain.block_building_context(),
+                &mut local_ctx,
+                &mut block_state,
+                &|_| Ok(()),
+            )?;
+            results.push(result);
+            let (bundle_state, _) = block_state.into_parts();
+
+            self.bundle_state = Some(bundle_state);
+            self.partial_block = partial_block
+        }
+
+        let second_result = results.pop().unwrap();
+        let first_result = results.pop().unwrap();
+        if first_result != second_result {
+            eyre::bail!("Second order commit differs from the first (caching error) first: {:#?}, second: {:#?}", first_result, second_result);
+        }
+
+        Ok(first_result)
     }
 
     pub fn commit_order_ok(&mut self) -> ExecutionResult {
@@ -272,21 +292,33 @@ impl TestSetup {
     }
 
     pub fn current_nonce(&self, named_addr: NamedAddr) -> eyre::Result<u64> {
+        let mut local_cached_reads = LocalCachedReads::default();
+        let shared_cached_reads = SharedCachedReads::default();
+
         let state_provider = self.test_chain.provider_factory().latest()?;
         let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.clone().unwrap_or_default())
-            .with_cached_reads(self.cached_reads.clone().unwrap_or_default());
+            .with_bundle_state(self.bundle_state.clone().unwrap_or_default());
 
-        Ok(block_state.nonce(self.test_chain.named_address(named_addr)?)?)
+        Ok(block_state.nonce(
+            self.test_chain.named_address(named_addr)?,
+            &shared_cached_reads,
+            &mut local_cached_reads,
+        )?)
     }
 
     pub fn balance(&self, named_addr: NamedAddr) -> eyre::Result<i128> {
+        let mut local_cached_reads = LocalCachedReads::default();
+        let shared_cached_reads = SharedCachedReads::default();
+
         let state_provider = self.test_chain.provider_factory().latest()?;
         let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.clone().unwrap_or_default())
-            .with_cached_reads(self.cached_reads.clone().unwrap_or_default());
+            .with_bundle_state(self.bundle_state.clone().unwrap_or_default());
         Ok(block_state
-            .balance(self.test_chain.named_address(named_addr)?)?
+            .balance(
+                self.test_chain.named_address(named_addr)?,
+                &shared_cached_reads,
+                &mut local_cached_reads,
+            )?
             .to())
     }
 

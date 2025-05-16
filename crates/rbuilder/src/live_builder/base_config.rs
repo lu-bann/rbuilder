@@ -8,7 +8,7 @@ use crate::{
         StateProviderFactory,
     },
     roothash::RootHashContext,
-    telemetry::{setup_reloadable_tracing_subscriber, LoggerConfig},
+    utils::tracing::{setup_tracing_subscriber, LoggerConfig},
     utils::{
         constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
         http_provider, ProviderFactoryReopener, Signer,
@@ -70,8 +70,6 @@ pub struct BaseConfig {
     pub log_json: bool,
     log_level: EnvOrValue<String>,
     pub log_color: bool,
-    /// Enables dynamic logging (saving logs to a file)
-    pub log_enable_dynamic: bool,
 
     pub error_storage_path: Option<PathBuf>,
 
@@ -124,6 +122,7 @@ pub struct BaseConfig {
 
     /// Number of threads used for incoming order simulation
     pub simulation_threads: usize,
+    pub simulation_use_random_coinbase: bool,
 
     /// uses cached sparse trie for root hash
     pub root_hash_use_sparse_trie: bool,
@@ -140,6 +139,8 @@ pub struct BaseConfig {
 
     /// Config for IPC state provider
     pub ipc_provider: Option<IpcProviderConfig>,
+
+    pub evm_caching_enable: bool,
 
     // backtest config
     backtest_fetch_mempool_data_dir: EnvOrValue<String>,
@@ -185,11 +186,10 @@ impl BaseConfig {
         let log_level = self.log_level.value()?;
         let config = LoggerConfig {
             env_filter: log_level,
-            file: None,
             log_json: self.log_json,
             log_color: self.log_color,
         };
-        setup_reloadable_tracing_subscriber(config)?;
+        setup_tracing_subscriber(config)?;
         Ok(())
     }
 
@@ -259,6 +259,9 @@ impl BaseConfig {
             constraint_subscriber: None,
             constraint_store: Default::default(),
             sbundle_merger_selected_signers: Arc::new(self.sbundle_mergeable_signers()),
+
+            evm_caching_enable: self.evm_caching_enable,
+            simulation_use_random_coinbase: self.simulation_use_random_coinbase,
         })
     }
 
@@ -545,7 +548,6 @@ impl Default for BaseConfig {
             log_json: false,
             log_level: "info".into(),
             log_color: false,
-            log_enable_dynamic: false,
             error_storage_path: None,
             coinbase_secret_key: None,
             flashbots_db: None,
@@ -577,10 +579,12 @@ impl Default for BaseConfig {
             backtest_builders: Vec::new(),
             live_builders: vec!["mgp-ordering".to_string(), "mp-ordering".to_string()],
             simulation_threads: 1,
+            simulation_use_random_coinbase: true,
             sbundle_mergeable_signers: None,
             sbundle_mergeabe_signers: None,
             require_non_empty_blocklist: Some(DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST),
             ipc_provider: None,
+            evm_caching_enable: false,
         }
     }
 }

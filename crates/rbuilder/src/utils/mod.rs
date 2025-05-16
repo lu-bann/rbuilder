@@ -1,5 +1,7 @@
 //! a2r prefix = alloy to reth conversion
 
+use std::time::{Duration, Instant};
+
 use crate::primitives::{
     serialize::{RawTx, TxEncoding},
     TransactionSignedEcRecoveredWithBlobs,
@@ -38,6 +40,7 @@ mod tx_signer;
 pub use tx_signer::Signer;
 
 pub mod provider_head_state;
+pub mod receipts;
 pub mod tracing;
 
 #[cfg(test)]
@@ -149,12 +152,23 @@ pub fn as_hash_set<T: Eq + std::hash::Hash + Copy>(slice: &[T]) -> ahash::HashSe
     set
 }
 
+/// using u64 for ms is safe since 2^64 ms = 2^64/1000/60/60/24/365 years = 584942417 years.
 pub fn offset_datetime_to_timestamp_ms(date: OffsetDateTime) -> u64 {
     (date.unix_timestamp_nanos() / 1_000_000) as u64
 }
 
 pub fn timestamp_ms_to_offset_datetime(timestamp: u64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp_nanos((timestamp * 1_000_000) as i128)
+    OffsetDateTime::from_unix_timestamp_nanos((timestamp as i128) * 1_000_000)
+        .expect("failed to convert timestamp")
+}
+
+/// using u64 for us is safe since 2^64 us = 2^64/1000/60/60/24/365 years = 584942 years.
+pub fn offset_datetime_to_timestamp_us(date: OffsetDateTime) -> u64 {
+    (date.unix_timestamp_nanos() / 1_000) as u64
+}
+
+pub fn timestamp_us_to_offset_datetime(timestamp: u64) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp_nanos((timestamp as i128) * 1_000)
         .expect("failed to convert timestamp")
 }
 
@@ -205,6 +219,21 @@ pub fn format_offset_datetime_rfc3339(datetime: &OffsetDateTime) -> String {
     datetime
         .format(&Rfc3339)
         .expect("failed to format datetime")
+}
+
+#[inline]
+pub fn elapsed_ms(start: Instant) -> f64 {
+    duration_ms(start.elapsed())
+}
+
+#[inline]
+pub fn elapsed_s(start: Instant) -> f64 {
+    duration_ms(start.elapsed()) / 1000.0
+}
+
+#[inline]
+pub fn duration_ms(duration: Duration) -> f64 {
+    duration.as_micros() as f64 / 1000.0
 }
 
 #[cfg(test)]

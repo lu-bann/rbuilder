@@ -3,7 +3,7 @@ mod redistribution_algo;
 
 use crate::{
     backtest::{
-        execute::backtest_simulate_block,
+        execute::backtest_get_block_building_context_for_block,
         redistribute::redistribution_algo::{
             IncludedOrderData, RedistributionCalculator, RedistributionIdentityData,
             RedistributionResult,
@@ -14,14 +14,16 @@ use crate::{
         },
         BlockData, BuiltBlockData, OrdersWithTimestamp,
     },
+    building::BlockBuildingContext,
     live_builder::{block_list_provider::BlockList, cli::LiveBuilderConfig},
     primitives::{Order, OrderId},
     provider::StateProviderFactory,
-    utils::{signed_uint_delta, u256decimal_serde_helper},
+    utils::{elapsed_s, signed_uint_delta, u256decimal_serde_helper},
 };
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{utils::format_ether, Address, B256, I256, U256};
 pub use cli::run_backtest_redistribute;
+use itertools::Itertools;
 use rayon::prelude::*;
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
@@ -33,7 +35,7 @@ use std::{
 use tracing::{debug, error, info, info_span, trace, warn};
 use uuid::Uuid;
 
-use super::OrderFilteredReason;
+use super::{execute::backtest_simulate_block_with_context, OrderFilteredReason};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,32 +161,42 @@ where
         distribute_to_mempool_txs,
     );
 
-    let time_preparation_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let ctx = backtest_get_block_building_context_for_block(
+        &block_data,
+        provider.clone(),
+        config.base_config().chain_spec()?,
+        blocklist.clone(),
+        config.base_config().coinbase_signer()?,
+        config.base_config().evm_caching_enable,
+    )?;
+
+    let time_preparation_s = elapsed_s(start);
     let start = Instant::now();
 
     let results_without_exclusion = calculate_backtest_without_exclusion(
+        ctx.clone(),
         provider.clone(),
         config,
         block_data.clone(),
-        blocklist.clone(),
     )?;
 
-    let time_no_exclusion_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let time_no_exclusion_s = elapsed_s(start);
     let start = Instant::now();
 
     let exclusion_results = calculate_backtest_identity_and_order_exclusion(
+        ctx.clone(),
         provider.clone(),
         config,
         block_data.clone(),
         &available_orders,
         &results_without_exclusion,
-        blocklist.clone(),
     )?;
 
-    let time_single_exclusion_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let time_single_exclusion_s = elapsed_s(start);
     let start = Instant::now();
 
     let exclusion_results = calc_joint_exclusion_results(
+        ctx.clone(),
         provider.clone(),
         config,
         block_data.clone(),
@@ -192,10 +204,9 @@ where
         &results_without_exclusion,
         exclusion_results,
         distribute_to_mempool_txs,
-        blocklist.clone(),
     )?;
 
-    let time_joint_exclusion_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let time_joint_exclusion_s = elapsed_s(start);
     let start = Instant::now();
 
     let calculated_redistribution_result = apply_redistribution_formula(
@@ -226,7 +237,7 @@ where
         .map(|o| o.redistribution_value_received)
         .sum::<U256>();
 
-    let time_result_s = start.elapsed().as_millis() as f64 / 1000.0;
+    let time_result_s = elapsed_s(start);
 
     let time_total_s = time_preparation_s
         + time_no_exclusion_s
@@ -410,7 +421,21 @@ where
             simplified_orders.push(SimplifiedOrder::new_from_order(&available_order.order));
         }
     }
-    Ok(restore_landed_orders(block_txs, simplified_orders))
+    let result = restore_landed_orders(block_txs, simplified_orders);
+    {
+        for (order, result) in result.iter().sorted_by_key(|(o, _)| *o) {
+            trace!(
+            ?order,
+                   total_coinbase_profit = format_ether(result.total_coinbase_profit),
+                   unique_coinbase_profit = format_ether(result.unique_coinbase_profit),
+                   error = ?result.error,
+                   tx_hashes = ?result.tx_hashes,
+                   overlapping_txs = ?result.overlapping_txs,
+                   "Restored landed order"
+                )
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -492,6 +517,7 @@ fn split_orders_by_identities(
 
     let mut protect_signer_seen = false;
 
+    let mut included_without_address = HashSet::default();
     for order in &included_orders_available {
         let order_id = order.order.id();
         let address = match order_redistribution_address(&order.order, protect_signers) {
@@ -502,7 +528,8 @@ fn split_orders_by_identities(
                 address
             }
             None => {
-                warn!(order = ?order_id, "Included order redistribution address not found");
+                error!(order = ?order_id, "Included order redistribution address not found");
+                included_without_address.insert(order_id);
                 continue;
             }
         };
@@ -511,6 +538,10 @@ fn split_orders_by_identities(
         orders.push(order_id);
         orders_id_to_address.insert(order_id, address);
     }
+    let included_orders_available = included_orders_available
+        .into_iter()
+        .filter(|o| !included_without_address.contains(&o.order.id()))
+        .collect();
 
     for order in &block_data.available_orders {
         let id = order.order.id();
@@ -593,10 +624,10 @@ impl ResultsWithoutExclusion {
 }
 
 fn calculate_backtest_without_exclusion<P, ConfigType>(
+    ctx: BlockBuildingContext,
     provider: P,
     config: &ConfigType,
     block_data: BlockData,
-    blocklist: BlockList,
 ) -> eyre::Result<ResultsWithoutExclusion>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -608,6 +639,7 @@ where
         new_orders_included: orders_included,
         ..
     } = calc_profit_after_exclusion(
+        ctx.clone(),
         provider.clone(),
         config,
         &block_data,
@@ -617,7 +649,6 @@ where
             orders_excluded_before: vec![],
             profit_before: U256::ZERO,
         },
-        blocklist,
     )?;
     Ok(ResultsWithoutExclusion {
         profit,
@@ -658,12 +689,12 @@ impl ExclusionResults {
 }
 
 fn calculate_backtest_identity_and_order_exclusion<P, ConfigType>(
+    ctx: BlockBuildingContext,
     provider: P,
     config: &ConfigType,
     block_data: BlockData,
     available_orders: &AvailableOrders,
     results_without_exclusion: &ResultsWithoutExclusion,
-    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -689,11 +720,11 @@ where
             .map(|(id, exclusions)| {
                 trace!(order = ?id, excluding = ?exclusions, "Excluding orders for landed order");
                 calc_profit_after_exclusion(
+                    ctx.clone(),
                     provider.clone(),
                     config,
                     &block_data,
                     results_without_exclusion.exclusion_input(exclusions),
-                    blocklist.clone(),
                 )
                 .map(|ok| (id, ok))
             })
@@ -711,11 +742,11 @@ where
                 .clone();
             trace!(identity = ?address, excluding = ?orders, "Excluding orders for identity");
             calc_profit_after_exclusion(
+                ctx.clone(),
                 provider.clone(),
                 config,
                 &block_data,
                 results_without_exclusion.exclusion_input(orders),
-                blocklist.clone(),
             )
             .map(|ok| (address, ok))
         })
@@ -730,6 +761,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn calc_joint_exclusion_results<P, ConfigType>(
+    ctx: BlockBuildingContext,
     provider: P,
     config: &ConfigType,
     block_data: BlockData,
@@ -737,7 +769,6 @@ fn calc_joint_exclusion_results<P, ConfigType>(
     results_without_exclusion: &ResultsWithoutExclusion,
     mut exclusion_results: ExclusionResults,
     distribute_to_mempool_txs: bool,
-    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -800,11 +831,11 @@ where
             let orders = orders1.iter().chain(orders2.iter()).cloned().collect();
             trace!(?address1, ?address2, excluding = ?orders, "Calculating joint contribution");
             calc_profit_after_exclusion(
+                ctx.clone(),
                 provider.clone(),
                 config,
                 &block_data,
                 results_without_exclusion.exclusion_input(orders),
-                blocklist.clone(),
             )
             .map(|ok| ((address1, address2), ok))
         })
@@ -843,7 +874,7 @@ fn apply_redistribution_formula(
                 .get(id)
                 .expect("order is not restored");
             if let Some(error) = &restored_landed_order.error {
-                warn!(identity = ?address, order = ?id, err = ?error, "Landed order is not properly recovered");
+                error!(identity = ?address, order = ?id, err = ?error, "Landed order is not properly recovered");
                 continue;
             }
             debug!(identity = ?address, order = ?id, "Landed order is properly recovered");
@@ -1068,11 +1099,11 @@ struct ExclusionResult {
 
 /// calculate block profit excluding some orders
 fn calc_profit_after_exclusion<P, ConfigType>(
+    ctx: BlockBuildingContext,
     provider: P,
     config: &ConfigType,
     block_data: &BlockData,
     exclusion_input: ExclusionInput,
-    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResult>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -1097,14 +1128,12 @@ where
         exclusion_input.orders_excluded_before.into_iter().collect();
 
     let base_config = config.base_config();
-
-    let result = backtest_simulate_block(
+    let result = backtest_simulate_block_with_context(
+        ctx,
         block_data_with_excluded,
         provider.clone(),
-        base_config.chain_spec()?,
         base_config.backtest_builders.clone(),
         config,
-        blocklist,
         &base_config.sbundle_mergeable_signers(),
     )?
     .builder_outputs

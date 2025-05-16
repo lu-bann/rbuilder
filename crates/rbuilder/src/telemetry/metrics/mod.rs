@@ -6,24 +6,26 @@
 //! When metric server is spawned is serves prometheus metrics at: /debug/metrics/prometheus
 
 #![allow(unexpected_cfgs)]
-use crate::building::BuiltBlockTrace;
 use crate::{
+    building::BuiltBlockTrace,
     live_builder::block_list_provider::{blocklist_hash, BlockList},
     primitives::mev_boost::MevBoostRelayID,
-    utils::build_info::Version,
+    utils::{build_info::Version, duration_ms},
 };
 use alloy_primitives::{utils::Unit, U256};
 use bigdecimal::num_traits::Pow;
 use ctor::ctor;
 use lazy_static::lazy_static;
 use metrics_macros::register_metrics;
+use parking_lot::Mutex;
 use prometheus::{
     Counter, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
     Registry,
 };
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use std::time::Instant;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use time::OffsetDateTime;
 use tracing::error;
 
@@ -40,6 +42,9 @@ const RELAY_ERROR_OTHER: &str = "other";
 
 const SIM_STATUS_OK: &str = "sim_success";
 const SIM_STATUS_FAIL: &str = "sim_fail";
+
+const ROOT_HASH_PREFETCH_STEP: &str = "prefetcher";
+const ROOT_HASH_FINALIZE_STEP: &str = "finalize";
 
 /// We record timestamps only for blocks built within interval of the block timestamp
 const BLOCK_METRICS_TIMESTAMP_LOWER_DELTA: time::Duration = time::Duration::seconds(3);
@@ -98,6 +103,16 @@ register_metrics! {
     .unwrap();
 
 
+    pub static ROOT_HASH_FETCHES: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "rbuilder_sparse_mpt_root_hash_fetches",
+            "Number of nodes fetched in a finalize or prefetch step"
+        ),
+        &["step"],
+    )
+    .unwrap();
+
+
 
     pub static CURRENT_BLOCK: IntGauge =
         IntGauge::new("current_block", "Current Block").unwrap();
@@ -132,9 +147,10 @@ register_metrics! {
             "initiated_submissions",
             "Number of initiated submissions to the relays"
         ),
-        &["optimistic"],
+        &["optimistic","sent_to_slow","send_to_non_independent"],
     )
     .unwrap();
+
     pub static RELAY_SUBMIT_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("relay_submit_time", "Time to send bid to the relay (ms)")
             .buckets(linear_buckets_range(0.0, 3000.0, 50)),
@@ -177,6 +193,14 @@ register_metrics! {
         &["worker_id"]
     )
     .unwrap();
+    pub static SIMULATION_PRECOMPILE_CACHE_HITS: IntCounter = IntCounter::new(
+        "simulation_precompile_cache_hits",
+        "Precompile cache hits"
+    ).unwrap();
+    pub static SIMULATION_PRECOMPILE_CACHE_MISSES: IntCounter = IntCounter::new(
+        "simulation_precompile_cache_misses",
+        "Precompile cache misses"
+    ).unwrap();
     pub static PROVIDER_REOPEN_COUNTER: IntCounter = IntCounter::new(
         "provider_reopen_counter", "Counter of provider reopens").unwrap();
 
@@ -224,19 +248,19 @@ register_metrics! {
     // Metrics for important step of the block processing
     pub static BLOCK_FILL_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_fill_time", "Block Fill Times (ms)")
-            .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
+            .buckets(exponential_buckets_range(0.01, 3000.0, 200)),
         &["builder_name"]
     )
     .unwrap();
     pub static BLOCK_FINALIZE_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_finalize_time", "Block Finalize Times (ms)")
-            .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
+            .buckets(exponential_buckets_range(0.01, 3000.0, 200)),
         &[]
     )
     .unwrap();
     pub static BLOCK_ROOT_HASH_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_root_hash_time", "Block Root Hash Time (ms)")
-            .buckets(exponential_buckets_range(1.0, 2000.0, 100)),
+            .buckets(exponential_buckets_range(0.01, 2000.0, 200)),
         &[]
     )
     .unwrap();
@@ -289,6 +313,7 @@ register_metrics! {
         &[]
     )
     .unwrap();
+
 }
 
 // This function should be called periodically to reset histogram metrics.
@@ -302,7 +327,7 @@ pub fn reset_histogram_metrics() {
     }
 
     let now = Instant::now();
-    let mut last_reset = LAST_RESET.lock().unwrap();
+    let mut last_reset = LAST_RESET.lock();
     if now.duration_since(*last_reset) < HISTOGRAM_METRIC_RESET_PERIOD {
         return;
     }
@@ -408,10 +433,10 @@ pub fn add_finalized_block_metrics(
 
     BLOCK_FINALIZE_TIME
         .with_label_values(&[])
-        .observe(built_block_trace.finalize_time.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(built_block_trace.finalize_time));
     BLOCK_ROOT_HASH_TIME
         .with_label_values(&[])
-        .observe(built_block_trace.root_hash_time.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(built_block_trace.root_hash_time));
 
     BLOCK_BUILT_TXS
         .with_label_values(&[builder_name])
@@ -444,29 +469,37 @@ pub fn add_block_fill_time(
     }
     BLOCK_FILL_TIME
         .with_label_values(&[builder_name])
-        .observe(duration.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(duration));
 }
 
 pub fn add_block_validation_time(duration: Duration) {
     BLOCK_VALIDATION_TIME
         .with_label_values(&[])
-        .observe(duration.as_millis() as f64);
+        .observe(duration_ms(duration));
 }
 
 pub fn inc_active_slots() {
     ACTIVE_SLOTS.inc();
 }
 
-pub fn inc_initiated_submissions(optimistic: bool) {
+pub fn inc_initiated_submissions(
+    optimistic: bool,
+    sent_to_slow_relays: bool,
+    send_to_non_independent: bool,
+) {
     INITIATED_SUBMISSIONS
-        .with_label_values(&[&optimistic.to_string()])
-        .inc()
+        .with_label_values(&[
+            &optimistic.to_string(),
+            &sent_to_slow_relays.to_string(),
+            &send_to_non_independent.to_string(),
+        ])
+        .inc();
 }
 
 pub fn add_relay_submit_time(relay: &MevBoostRelayID, duration: Duration) {
     RELAY_SUBMIT_TIME
         .with_label_values(&[relay.as_str()])
-        .observe(duration.as_millis() as f64);
+        .observe(duration_ms(duration));
 }
 
 pub fn inc_relay_accepted_submissions(relay: &MevBoostRelayID, optimistic: bool) {
@@ -478,7 +511,7 @@ pub fn inc_relay_accepted_submissions(relay: &MevBoostRelayID, optimistic: bool)
 pub fn add_txfetcher_time_to_query(duration: Duration) {
     TXFETCHER_TRANSACTION_QUERY_TIME
         .with_label_values(&[])
-        .observe(duration.as_millis() as f64);
+        .observe(duration_ms(duration));
 
     TXFETCHER_TRANSACTION_COUNTER.inc();
 }
@@ -502,6 +535,14 @@ pub fn add_sim_thread_utilisation_timings(
     SIMULATION_THREAD_WAIT_TIME
         .with_label_values(&[&thread_id.to_string()])
         .inc_by(wait_time.as_micros() as u64);
+}
+
+pub fn inc_precompile_cache_hits() {
+    SIMULATION_PRECOMPILE_CACHE_HITS.inc();
+}
+
+pub fn inc_precompile_cache_misses() {
+    SIMULATION_PRECOMPILE_CACHE_MISSES.inc();
 }
 
 /// landed vs attempt
@@ -540,7 +581,7 @@ fn sim_status(success: bool) -> &'static str {
 pub fn add_order_simulation_time(duration: Duration, builder_name: &str, success: bool) {
     ORDER_SIMULATION_TIME
         .with_label_values(&[builder_name, sim_status(success)])
-        .observe(duration.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(duration));
 }
 
 pub fn mark_submission_start_time(block_sealed_at: OffsetDateTime) {
@@ -550,6 +591,24 @@ pub fn mark_submission_start_time(block_sealed_at: OffsetDateTime) {
     BLOCK_SEAL_END_SUBMIT_START_TIME
         .with_label_values(&[])
         .observe(value);
+}
+
+pub fn inc_root_hash_prefetch_count(fetched_nodes: usize) {
+    if fetched_nodes == 0 {
+        return;
+    }
+    ROOT_HASH_FETCHES
+        .with_label_values(&[ROOT_HASH_PREFETCH_STEP])
+        .inc_by(fetched_nodes.try_into().unwrap_or_default());
+}
+
+pub fn inc_root_hash_finalize_count(fetched_nodes: usize) {
+    if fetched_nodes == 0 {
+        return;
+    }
+    ROOT_HASH_FETCHES
+        .with_label_values(&[ROOT_HASH_FINALIZE_STEP])
+        .inc_by(fetched_nodes.try_into().unwrap_or_default());
 }
 
 pub fn gather_prometheus_metrics(registry: &Registry) -> String {

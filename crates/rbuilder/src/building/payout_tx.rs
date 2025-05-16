@@ -1,10 +1,10 @@
-use super::{BlockBuildingContext, BlockState};
+use super::{evm::EvmFactory, BlockBuildingContext, BlockState, ThreadBlockBuildingContext};
 use crate::utils::Signer;
 use alloy_consensus::{constants::KECCAK_EMPTY, TxEip1559};
 use alloy_primitives::{Address, TxKind as TransactionKind, U256};
 use reth_chainspec::ChainSpec;
 use reth_errors::ProviderError;
-use reth_evm::{Evm, EvmFactory};
+use reth_evm::Evm;
 use reth_primitives::{Recovered, Transaction, TransactionSigned};
 use revm::context::result::{EVMError, ExecutionResult};
 
@@ -43,15 +43,34 @@ pub enum PayoutTxErr {
     NoSigner,
 }
 
+impl PartialEq for PayoutTxErr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (PayoutTxErr::Reth(_), PayoutTxErr::Reth(_)) => true,
+            (PayoutTxErr::SignError(a), PayoutTxErr::SignError(b)) => a == b,
+            (PayoutTxErr::EvmError(_), PayoutTxErr::EvmError(_)) => true,
+            (PayoutTxErr::NoSigner, PayoutTxErr::NoSigner) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PayoutTxErr {}
+
 pub fn insert_test_payout_tx(
     to: Address,
     ctx: &BlockBuildingContext,
+    local_ctx: &mut ThreadBlockBuildingContext,
     state: &mut BlockState,
     gas_limit: u64,
 ) -> Result<Option<u64>, PayoutTxErr> {
     let builder_signer = ctx.builder_signer.as_ref().ok_or(PayoutTxErr::NoSigner)?;
 
-    let nonce = state.nonce(builder_signer.address)?;
+    let nonce = state.nonce(
+        builder_signer.address,
+        &ctx.shared_cached_reads,
+        &mut local_ctx.cached_reads,
+    )?;
 
     let tx_value = 10u128.pow(18); // 10 ether
     let tx = create_payout_tx(
@@ -64,11 +83,12 @@ pub fn insert_test_payout_tx(
         U256::from(tx_value),
     )?;
 
-    let mut db = state.new_db_ref();
+    let mut db = state.new_db_ref(&ctx.shared_cached_reads, &mut local_ctx.cached_reads);
     let mut evm = ctx.evm_factory.create_evm(db.as_mut(), ctx.evm_env.clone());
 
     let cache_account = evm.db_mut().load_cache_account(builder_signer.address)?;
-    cache_account.increment_balance(tx_value * 2); // double to cover tx value and fee
+    let gas_fee = ctx.evm_env.block_env.basefee as u128 * gas_limit as u128;
+    cache_account.increment_balance((tx_value + gas_fee) * 2); // double for luck
 
     let res = evm.transact(&tx)?;
     match res.result {
@@ -90,14 +110,31 @@ pub enum EstimatePayoutGasErr {
     #[error("Failed to estimate gas limit")]
     FailedToEstimate,
 }
+
+impl PartialEq for EstimatePayoutGasErr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (EstimatePayoutGasErr::Reth(_), EstimatePayoutGasErr::Reth(_)) => true,
+            (EstimatePayoutGasErr::PayoutTxErr(a), EstimatePayoutGasErr::PayoutTxErr(b)) => a == b,
+            (EstimatePayoutGasErr::FailedToEstimate, EstimatePayoutGasErr::FailedToEstimate) => {
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for EstimatePayoutGasErr {}
+
 pub fn estimate_payout_gas_limit(
     to: Address,
     ctx: &BlockBuildingContext,
+    local_ctx: &mut ThreadBlockBuildingContext,
     state: &mut BlockState,
     gas_used: u64,
 ) -> Result<u64, EstimatePayoutGasErr> {
     tracing::trace!(address = ?to, "Estimating payout gas");
-    if state.code_hash(to)? == KECCAK_EMPTY {
+    if state.code_hash(to, &ctx.shared_cached_reads, &mut local_ctx.cached_reads)? == KECCAK_EMPTY {
         return Ok(21_000);
     }
 
@@ -107,10 +144,10 @@ pub fn estimate_payout_gas_limit(
         .gas_limit
         .checked_sub(gas_used)
         .unwrap_or_default();
-    let estimation = insert_test_payout_tx(to, ctx, state, gas_left)?
+    let estimation = insert_test_payout_tx(to, ctx, local_ctx, state, gas_left)?
         .ok_or(EstimatePayoutGasErr::FailedToEstimate)?;
 
-    if insert_test_payout_tx(to, ctx, state, estimation)?.is_some() {
+    if insert_test_payout_tx(to, ctx, local_ctx, state, estimation)?.is_some() {
         return Ok(estimation);
     }
 
@@ -124,7 +161,7 @@ pub fn estimate_payout_gas_limit(
             return Ok(right);
         }
 
-        if insert_test_payout_tx(to, ctx, state, mid)?.is_some() {
+        if insert_test_payout_tx(to, ctx, local_ctx, state, mid)?.is_some() {
             right = mid;
         } else {
             left = mid;
@@ -186,10 +223,13 @@ mod tests {
             proposer,
             Some(signer),
             Arc::new(MockRootHasher {}),
+            false,
         );
         let mut state = BlockState::new(provider_factory.latest().unwrap());
+        let mut local_ctx = ThreadBlockBuildingContext::default();
 
-        let estimate_result = estimate_payout_gas_limit(proposer, &ctx, &mut state, 0);
+        let estimate_result =
+            estimate_payout_gas_limit(proposer, &ctx, &mut local_ctx, &mut state, 0);
         assert_matches!(estimate_result, Ok(_));
         assert_eq!(estimate_result.unwrap(), 21_000);
     }

@@ -194,7 +194,11 @@ pub fn generate_inclusion_proofs(
             .iter()
             .map(|proof_data| &proof_data.proof_data)
             .collect();
-        match verify_inclusion_proofs(&constraints_proofs_data, &inclusion_proof, root) {
+        match verify_inclusion_proofs(
+            &constraints_proofs_data,
+            &inclusion_proof,
+            B256::from_slice(root.as_slice()),
+        ) {
             Ok(_) => {
                 info!("Inclusion proofs verification successfull")
             }

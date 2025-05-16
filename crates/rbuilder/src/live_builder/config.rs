@@ -47,7 +47,7 @@ use crate::{
 use alloy_chains::ChainKind;
 use alloy_primitives::{
     utils::{format_ether, parse_ether},
-    FixedBytes, B256,
+    FixedBytes, B256, U256,
 };
 use ethereum_consensus::{
     builder::compute_builder_domain, crypto::SecretKey, primitives::Version,
@@ -55,7 +55,6 @@ use ethereum_consensus::{
 };
 use eyre::Context;
 use lazy_static::lazy_static;
-use reth::revm::cached::CachedReads;
 use reth_chainspec::{Chain, ChainSpec, NamedChain};
 use reth_db::DatabaseEnv;
 use reth_node_api::NodeTypesWithDBAdapter;
@@ -107,7 +106,16 @@ pub struct Config {
 
     /// selected builder configurations
     pub builders: Vec<BuilderConfig>,
+
+    /// When the sample bidder (see TrueBlockValueBiddingService) will start bidding.
+    /// Usually a negative number.
+    pub slot_delta_to_start_bidding_ms: Option<i64>,
+    /// Value added to the bids (see TrueBlockValueBiddingService).
+    pub subsidy: Option<String>,
 }
+
+const DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS: i64 = -8000;
+const DEFAULT_INDEPENDENT_BID_THRESHOLD_ETH: &str = "0";
 
 #[serde_as]
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -127,12 +135,15 @@ pub struct L1Config {
     /// Bids above this value will always be submitted in non-optimistic mode.
     pub optimistic_max_bid_value_eth: String,
 
-    ///Name kept singular for backwards compatibility
+    /// Name kept singular for backwards compatibility
     #[serde_as(deserialize_as = "OneOrMany<EnvOrValue<String>>")]
     pub cl_node_url: Vec<EnvOrValue<String>>,
 
     /// Genesis fork version for the chain. If not provided it will be fetched from the beacon client.
     pub genesis_fork_version: Option<String>,
+
+    /// Bids above this value will only go to independent relays.
+    pub independent_bid_threshold_eth: String,
 }
 
 impl Default for L1Config {
@@ -146,6 +157,7 @@ impl Default for L1Config {
             optimistic_max_bid_value_eth: "0.0".to_string(),
             cl_node_url: vec![EnvOrValue::from("http://127.0.0.1:3500")],
             genesis_fork_version: None,
+            independent_bid_threshold_eth: DEFAULT_INDEPENDENT_BID_THRESHOLD_ETH.to_owned(),
         }
     }
 }
@@ -186,6 +198,8 @@ impl L1Config {
                     relay_config.name.clone(),
                     submit_config,
                     relay_config.mode == RelayMode::Test,
+                    relay_config.is_fast(),
+                    relay_config.is_independent(),
                 ));
             } else {
                 eyre::bail!(
@@ -303,6 +317,7 @@ impl L1Config {
             signer,
             optimistic_config,
             bid_observer,
+            independent_bid_threshold: parse_ether(&self.independent_bid_threshold_eth)?,
         })
     }
 
@@ -365,8 +380,19 @@ impl LiveBuilderConfig for Config {
             self.base_config.coinbase_signer()?.address,
             WALLET_INIT_HISTORY_SIZE,
         )?;
-        let bidding_service: Box<dyn BiddingService> =
-            Box::new(TrueBlockValueBiddingService::new(&wallet_history));
+        let subsidy = self
+            .subsidy
+            .as_ref()
+            .map(|s| parse_ether(s))
+            .unwrap_or(Ok(U256::ZERO))?;
+        let bidding_service: Box<dyn BiddingService> = Box::new(TrueBlockValueBiddingService::new(
+            &wallet_history,
+            time::Duration::milliseconds(
+                self.slot_delta_to_start_bidding_ms
+                    .unwrap_or(DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS),
+            ),
+            subsidy,
+        ));
 
         let sink_factory = Box::new(BlockSealingBidderFactory::new(
             bidding_service,
@@ -412,7 +438,7 @@ impl LiveBuilderConfig for Config {
         &self,
         building_algorithm_name: &str,
         input: BacktestSimulateBlockInput<'_, P>,
-    ) -> eyre::Result<(Block, CachedReads)>
+    ) -> eyre::Result<Block>
     where
         P: StateProviderFactory + Clone + 'static,
     {
@@ -545,6 +571,8 @@ impl Default for Config {
                     }),
                 },
             ],
+            slot_delta_to_start_bidding_ms: None,
+            subsidy: None,
         }
     }
 }
@@ -699,6 +727,8 @@ lazy_static! {
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                is_fast: None,
+                is_independent: None,
             },
         );
         map.insert(
@@ -717,6 +747,8 @@ lazy_static! {
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                is_fast: None,
+                is_independent: None,
             },
         );
         map.insert(
@@ -735,6 +767,8 @@ lazy_static! {
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                is_fast: None,
+                is_independent: None,
             },
         );
         map.insert(
@@ -752,6 +786,8 @@ lazy_static! {
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                is_fast: None,
+                is_independent: None,
             },
         );
         map.insert(
@@ -770,6 +806,8 @@ lazy_static! {
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                is_fast: None,
+                is_independent: None,
             },
         );
         map
