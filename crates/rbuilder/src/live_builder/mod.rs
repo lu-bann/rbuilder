@@ -329,7 +329,7 @@ where
                     if time_until_constraints_cutoff.is_positive() {
                         debug!(
                             slot = payload.slot(),
-                            time_left = ?time_to_slot,
+                            time_to_slot = ?time_to_slot.as_seconds_f64(),
                             "Constraints cutoff time hasn't passed yet, sleeping for {}s",
                             time_until_constraints_cutoff.as_seconds_f64()
                         );

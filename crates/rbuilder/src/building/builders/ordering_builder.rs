@@ -76,6 +76,7 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
     P: StateProviderFactory + Clone + 'static,
     OrderPriorityType: OrderPriority,
 {
+    info!("run_ordering_builder");
     let payload_id = input.ctx.payload_id;
 
     let block_state: Arc<dyn StateProvider> = match input
@@ -93,6 +94,7 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
             return;
         }
     };
+    info!("Fetched block state");
 
     let nonces = NonceCache::new(block_state.clone());
 
@@ -127,7 +129,11 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
             }
         }
 
+        info!("Got new orders");
+
         let orders = order_intake_consumer.current_block_orders();
+
+        info!("Got new orders to build block");
 
         if let Some(ref slot_constraints) = slot_constraints {
             match builder.build_block_with_constraints(
@@ -296,7 +302,7 @@ impl OrderingBuilderContext {
         cancel_block: CancellationToken,
         slot_constraints: Vec<SignedConstraints>,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
-        info!("build_blocks_with_constraints");
+        info!("build_block_with_constraints");
         let build_attempt_id: u32 = rand::random();
         let span = info_span!("build_run", build_attempt_id);
         let _guard = span.enter();

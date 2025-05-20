@@ -157,7 +157,7 @@ where
             let slot_constraints = slot_constraints.clone();
             tokio::task::spawn_blocking(move || {
                 if let Some(constraints) = &slot_constraints {
-                    info!("Preparing block with constraints for slot {}", slot);
+                    info!("Preparing block with constraints for slot: {slot}");
                     builder.build_blocks_with_constraints(input, constraints.clone());
                 } else {
                     builder.build_blocks(input);
