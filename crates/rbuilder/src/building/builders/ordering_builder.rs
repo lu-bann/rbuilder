@@ -112,12 +112,15 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
     let mut removed_orders = Vec::new();
     let mut use_suggested_fee_recipient_as_coinbase = config.coinbase_payment;
     'building: loop {
+        info!("is cancelled: {:?}", input.cancel.is_cancelled());
         if input.cancel.is_cancelled() {
             break 'building;
         }
 
+        info!("Waiting for new orders");
         match order_intake_consumer.blocking_consume_next_batch() {
             Ok(ok) => {
+                info!("orders present: {:?}", ok);
                 // Only break the loop if there are no orders to process and no slot constraints
                 if !ok && slot_constraints.is_none() {
                     break 'building;
