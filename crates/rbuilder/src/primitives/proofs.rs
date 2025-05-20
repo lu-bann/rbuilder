@@ -163,10 +163,6 @@ pub fn generate_inclusion_proofs(
         .multi_prove(&paths)
         .map_err(|_| ProofError::FailedToGenerateProof)?;
     assert_eq!(root, witness);
-    info!("Multi proofs generated");
-    info!("multi proofs leaves {:?}", multi_proof.leaves);
-    info!("multi proofs branch {:?}", multi_proof.branch);
-    info!("multi proofs indices {:?}", multi_proof.indices);
 
     ssz_rs::multiproofs::verify_merkle_multiproof(
         &multi_proof.leaves,
@@ -176,12 +172,10 @@ pub fn generate_inclusion_proofs(
     )
     .map_err(|_| ProofError::VerificationFailed)?;
 
-    info!("Createing inclusiong proofs from merkle proofs");
     let inclusion_proof = create_inclusion_proof_from_multi_proof(multi_proof, constraint_txs)?;
 
     // Verify the multiproof if requested
     if verify_proof {
-        info!("Verifying inclusion proofs");
         let proof_data_vec: Vec<SignedConstraintsWithProofData> = constraints
             .iter()
             .map(|c| {
@@ -288,21 +282,18 @@ pub fn verify_inclusion_proofs(
         .into_iter()
         .map(|h| h.as_slice().try_into().unwrap())
         .collect::<Vec<_>>();
-    info!("incluision proof leaves {:?}", leaves);
     let merkle_proofs = proofs
         .merkle_hashes
         .to_vec()
         .iter()
         .map(|h| h.as_slice().try_into().unwrap())
         .collect::<Vec<_>>();
-    info!("incluision proof merkle_proofs {:?}", merkle_proofs);
     let indexes = proofs
         .generalized_indexes
         .to_vec()
         .iter()
         .map(|h| *h as usize)
         .collect::<Vec<_>>();
-    info!("incluision proof indexes {:?}", indexes);
 
     let root = root.as_slice().try_into().expect("Invalid root length");
 

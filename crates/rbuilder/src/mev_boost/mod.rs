@@ -528,11 +528,6 @@ impl RelayClient {
                 serde_json::to_vec(&submission_with_metadata.submission)
             };
 
-            let res = serde_json::from_slice::<SubmitBlockRequest>(
-                json_result.as_ref().unwrap().clone().as_slice(),
-            );
-            info!("json request {:?}", res);
-
             (
                 json_result.map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?,
                 JSON_CONTENT_TYPE,

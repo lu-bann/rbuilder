@@ -115,10 +115,9 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
             break 'building;
         }
 
-        let should_block_on_orders = slot_constraints.is_none();
+        let blocking = slot_constraints.is_none();
 
-        info!("Waiting for new orders");
-        match order_intake_consumer.blocking_consume_next_batch(should_block_on_orders) {
+        match order_intake_consumer.blocking_consume_next_batch(blocking) {
             Ok(ok) => {
                 info!("orders present: {:?}", ok);
                 // Only break the loop if there are no orders to process and no slot constraints
@@ -132,11 +131,7 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
             }
         }
 
-        info!("Got new orders");
-
         let orders = order_intake_consumer.current_block_orders();
-
-        info!("Got new orders to build block");
 
         if let Some(ref slot_constraints) = slot_constraints {
             match builder.build_block_with_constraints(

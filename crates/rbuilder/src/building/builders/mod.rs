@@ -73,11 +73,8 @@ impl OrderConsumer {
     /// New commands are accumulatd in self.new_commands
     /// Call apply_new_commands to easily consume them.
     /// This method will block until the first command is received
-    pub fn blocking_consume_next_commands(
-        &mut self,
-        should_block_on_orders: bool,
-    ) -> eyre::Result<bool> {
-        if should_block_on_orders {
+    pub fn blocking_consume_next_commands(&mut self, blocking: bool) -> eyre::Result<bool> {
+        if blocking {
             match self.orders.blocking_recv() {
                 Ok(order) => self.new_commands.push(order),
                 Err(RecvError::Closed) => {
@@ -98,6 +95,7 @@ impl OrderConsumer {
                     }
                     Err(TryRecvError::Empty) => {
                         if start.elapsed().as_millis() >= 1000 {
+                            info!("No new orders in 1s, stopping");
                             return Ok(true);
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -165,13 +163,10 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
 
     /// Returns true if success, on false builder should stop
     /// Blocks until the first item in the next batch is available.
-    pub fn blocking_consume_next_batch(
-        &mut self,
-        should_block_on_orders: bool,
-    ) -> eyre::Result<bool> {
+    pub fn blocking_consume_next_batch(&mut self, blocking: bool) -> eyre::Result<bool> {
         if !self
             .order_consumer
-            .blocking_consume_next_commands(should_block_on_orders)?
+            .blocking_consume_next_commands(blocking)?
         {
             return Ok(false);
         }
