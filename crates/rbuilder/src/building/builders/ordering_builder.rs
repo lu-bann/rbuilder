@@ -300,7 +300,6 @@ impl OrderingBuilderContext {
         cancel_block: CancellationToken,
         slot_constraints: Vec<SignedConstraints>,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
-        info!("build_block_with_constraints");
         let build_attempt_id: u32 = rand::random();
         let span = info_span!("build_run", build_attempt_id);
         let _guard = span.enter();
@@ -336,7 +335,6 @@ impl OrderingBuilderContext {
         // Then fill the remaining orders
         self.fill_orders(&mut block_building_helper, block_orders, build_start)?;
         block_building_helper.set_trace_fill_time(build_start.elapsed());
-        info!("Finish build_blocks_with_constraints");
         Ok(Box::new(block_building_helper))
     }
 

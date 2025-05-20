@@ -196,11 +196,6 @@ async fn run_submit_to_relays_job(
             Some(slot_constraints) => {
                 let payload_transactions = block.sealed_block.body().transactions.clone();
 
-                debug!(
-                    "Calculating inclusion proofs for slot: {:?}",
-                    slot_constraints
-                );
-
                 match generate_inclusion_proofs(payload_transactions, slot_constraints, true) {
                     Ok(proofs) => Some(proofs),
                     Err(err) => {
