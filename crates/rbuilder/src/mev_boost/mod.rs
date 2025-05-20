@@ -19,7 +19,6 @@ use serde_with::{serde_as, DisplayFromStr};
 use ssz::Encode;
 use std::{io::Write, str::FromStr};
 use submission::{SubmitBlockRequest, SubmitBlockRequestNoBlobs, SubmitBlockRequestWithMetadata};
-use tracing::info;
 use url::Url;
 
 pub use error::*;
@@ -551,17 +550,6 @@ impl RelayClient {
                 .finish()
                 .map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?;
         }
-
-        info!("json body {:?}", Body::from(body_data.clone()));
-        info!(
-            "json body bytes {:?}",
-            axum::body::to_bytes(
-                axum::body::Body::from(body_data.clone()),
-                (1024 * 1024 * 10) as usize
-            )
-            .await
-            .unwrap()
-        );
 
         builder = builder.headers(headers).body(Body::from(body_data));
 

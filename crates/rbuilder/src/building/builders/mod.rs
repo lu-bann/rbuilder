@@ -95,8 +95,7 @@ impl OrderConsumer {
                     }
                     Err(TryRecvError::Empty) => {
                         if start.elapsed().as_millis() >= 1000 {
-                            info!("No new orders in 1s, stopping");
-                            return Ok(true);
+                            return Ok(false);
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
