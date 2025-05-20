@@ -247,7 +247,7 @@ fn run_order_intake(
             break 'building;
         }
 
-        match order_intake_consumer.consume_next_batch() {
+        match order_intake_consumer.consume_next_batch(true) {
             Ok(ok) => {
                 if !ok {
                     break 'building;

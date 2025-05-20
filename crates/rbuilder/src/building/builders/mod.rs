@@ -73,16 +73,45 @@ impl OrderConsumer {
     /// New commands are accumulatd in self.new_commands
     /// Call apply_new_commands to easily consume them.
     /// This method will block until the first command is received
-    pub fn blocking_consume_next_commands(&mut self) -> eyre::Result<bool> {
-        match self.orders.blocking_recv() {
-            Ok(order) => self.new_commands.push(order),
-            Err(RecvError::Closed) => {
-                return Ok(false);
+    pub fn blocking_consume_next_commands(
+        &mut self,
+        should_block_on_orders: bool,
+    ) -> eyre::Result<bool> {
+        if should_block_on_orders {
+            match self.orders.blocking_recv() {
+                Ok(order) => self.new_commands.push(order),
+                Err(RecvError::Closed) => {
+                    return Ok(false);
+                }
+                Err(RecvError::Lagged(msg)) => {
+                    warn!(msg, "Builder thread lagging on sim orders channel");
+                }
             }
-            Err(RecvError::Lagged(msg)) => {
-                warn!(msg, "Builder thread lagging on sim orders channel");
+        } else {
+            let start = std::time::Instant::now();
+
+            loop {
+                match self.orders.try_recv() {
+                    Ok(order) => {
+                        self.new_commands.push(order);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        if start.elapsed().as_millis() >= 1000 {
+                            return Ok(true);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(TryRecvError::Closed) => {
+                        return Ok(false);
+                    }
+                    Err(TryRecvError::Lagged(msg)) => {
+                        warn!(msg, "Builder thread lagging on sim orders channel");
+                    }
+                }
             }
         }
+
         for _ in 0..1024 {
             match self.orders.try_recv() {
                 Ok(order) => self.new_commands.push(order),
@@ -136,8 +165,14 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
 
     /// Returns true if success, on false builder should stop
     /// Blocks until the first item in the next batch is available.
-    pub fn blocking_consume_next_batch(&mut self) -> eyre::Result<bool> {
-        if !self.order_consumer.blocking_consume_next_commands()? {
+    pub fn blocking_consume_next_batch(
+        &mut self,
+        should_block_on_orders: bool,
+    ) -> eyre::Result<bool> {
+        if !self
+            .order_consumer
+            .blocking_consume_next_commands(should_block_on_orders)?
+        {
             return Ok(false);
         }
         if !self.update_onchain_nonces()? {

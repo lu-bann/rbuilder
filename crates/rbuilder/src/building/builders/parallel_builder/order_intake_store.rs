@@ -27,8 +27,8 @@ impl OrderIntakeStore {
         }
     }
 
-    pub fn consume_next_batch(&mut self) -> eyre::Result<bool> {
-        self.order_consumer.blocking_consume_next_commands()?;
+    pub fn consume_next_batch(&mut self, should_block_on_order: bool) -> eyre::Result<bool> {
+        self.order_consumer.blocking_consume_next_commands(should_block_on_order)?;
         self.order_consumer.apply_new_commands(&mut self.order_sink);
         Ok(true)
     }

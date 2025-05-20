@@ -76,7 +76,6 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
     P: StateProviderFactory + Clone + 'static,
     OrderPriorityType: OrderPriority,
 {
-    info!("run_ordering_builder");
     let payload_id = input.ctx.payload_id;
 
     let block_state: Arc<dyn StateProvider> = match input
@@ -94,7 +93,6 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
             return;
         }
     };
-    info!("Fetched block state");
 
     let nonces = NonceCache::new(block_state.clone());
 
@@ -117,8 +115,10 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
             break 'building;
         }
 
+        let should_block_on_orders = slot_constraints.is_none();
+
         info!("Waiting for new orders");
-        match order_intake_consumer.blocking_consume_next_batch() {
+        match order_intake_consumer.blocking_consume_next_batch(should_block_on_orders) {
             Ok(ok) => {
                 info!("orders present: {:?}", ok);
                 // Only break the loop if there are no orders to process and no slot constraints
