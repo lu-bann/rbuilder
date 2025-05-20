@@ -100,11 +100,11 @@ mod tests {
                 block_building_helper::BiddableUnfinishedBlock,
                 mock_block_building_helper::MockBlockBuildingHelper,
             },
-            ExecutionResult,
+            ExecutionResult, TransactionExecutionInfo,
         },
         primitives::{AccountNonce, Order},
     };
-    use alloy_primitives::U256;
+    use alloy_primitives::{I256, U256};
 
     use super::BestBlockState;
 
@@ -137,9 +137,13 @@ mod tests {
                     inplace_sim: Default::default(),
                     gas_used: Default::default(),
                     order: Order::Tx(order),
-                    txs: vec![tx],
+                    tx_infos: vec![TransactionExecutionInfo {
+                        tx,
+                        receipt: Default::default(),
+                        gas_used: 0,
+                        coinbase_profit: I256::ZERO,
+                    }],
                     original_order_ids: Default::default(),
-                    receipts: Default::default(),
                     nonces_updated: Default::default(),
                     paid_kickbacks: Default::default(),
                 });

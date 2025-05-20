@@ -246,9 +246,9 @@ fn bundle_revert_tests(
         current_slot_value + 100,
     )?;
     let result = test_setup.commit_order_ok();
-    assert_eq!(result.receipts.len(), 2);
-    assert!(result.receipts[0].success);
-    assert!(!result.receipts[1].success);
+    assert_eq!(result.tx_infos.len(), 2);
+    assert!(result.tx_infos[0].receipt.success);
+    assert!(!result.tx_infos[1].receipt.success);
 
     // this bundle has 2 txs one ok other has incorrect nonce
     begin_bundle(test_setup);
@@ -260,8 +260,8 @@ fn bundle_revert_tests(
         current_slot_value,
     )?;
     let result = test_setup.commit_order_ok();
-    assert_eq!(result.receipts.len(), 1);
-    assert!(result.receipts[0].success);
+    assert_eq!(result.tx_infos.len(), 1);
+    assert!(result.tx_infos[0].receipt.success);
 
     // for share bundle also try nested bundles
     if share_bundle {
@@ -353,6 +353,26 @@ fn test_bundle_ok_refunds() -> eyre::Result<()> {
         result.paid_kickbacks,
         vec![(recipient, U256::from(expected_refund))]
     );
+    Ok(())
+}
+
+#[test]
+fn test_bundle_ok_inner_tx_profits() -> eyre::Result<()> {
+    let target_block = 11;
+    let mut test_setup = TestSetup::gen_test_setup(BlockArgs::default().number(target_block))?;
+    let profits = [100_000u64, 200_000u64, 10u64];
+    let mut tx_hashes = Vec::default();
+    test_setup.begin_bundle_order(target_block);
+    for (index, profit) in profits.iter().enumerate() {
+        tx_hashes.push(test_setup.add_send_to_coinbase_tx(NamedAddr::User(index), *profit)?);
+    }
+    let result = test_setup.commit_order_ok();
+    let executed_profits = result
+        .tx_infos
+        .iter()
+        .map(|info| u64::try_from(info.coinbase_profit).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(profits, executed_profits.as_slice());
     Ok(())
 }
 

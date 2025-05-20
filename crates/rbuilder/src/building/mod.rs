@@ -1,5 +1,8 @@
 use crate::{
-    live_builder::{block_list_provider::BlockList, payload_events::InternalPayloadId},
+    live_builder::{
+        block_list_provider::BlockList, order_input::mempool_txs_detector::MempoolTxsDetector,
+        payload_events::InternalPayloadId,
+    },
     primitives::{
         MempoolTx, Order, OrderId, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
     },
@@ -21,14 +24,14 @@ use alloy_eips::{
     merge::BEACON_NONCE,
 };
 use alloy_evm::{block::system_calls::SystemCaller, env::EvmEnv, eth::eip6110};
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{utils::format_ether, Address, Bytes, B256, I256, U256};
 use alloy_rpc_types_beacon::events::PayloadAttributesEvent;
 use cached_reads::{LocalCachedReads, SharedCachedReads};
 use evm::EthCachedEvmFactory;
 use jsonrpsee::core::Serialize;
 use reth::{
     payload::PayloadId,
-    primitives::{Block, Receipt, SealedBlock},
+    primitives::{Block, SealedBlock},
     providers::ExecutionOutcome,
 };
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
@@ -55,7 +58,7 @@ use std::{
 };
 use thiserror::Error;
 use time::OffsetDateTime;
-use tracing::trace;
+use tracing::{error, trace};
 use tx_sim_cache::TxExecutionCache;
 
 pub mod block_orders;
@@ -106,6 +109,7 @@ pub struct BlockBuildingContext {
     pub payload_id: InternalPayloadId,
     pub shared_cached_reads: Arc<SharedCachedReads>,
     pub tx_execution_cache: Arc<TxExecutionCache>,
+    pub mempool_tx_detector: Arc<MempoolTxsDetector>,
 }
 
 impl BlockBuildingContext {
@@ -195,6 +199,7 @@ impl BlockBuildingContext {
             shared_cached_reads: Default::default(),
             tx_execution_cache: Arc::new(TxExecutionCache::new(evm_caching_enable)),
             max_blob_gas_per_block,
+            mempool_tx_detector: Arc::new(MempoolTxsDetector::new()),
         })
     }
 
@@ -291,6 +296,7 @@ impl BlockBuildingContext {
             shared_cached_reads: Default::default(),
             tx_execution_cache: Arc::new(TxExecutionCache::new(evm_caching_enable)),
             max_blob_gas_per_block,
+            mempool_tx_detector: Arc::new(MempoolTxsDetector::new()),
         }
     }
 
@@ -411,10 +417,8 @@ pub struct PartialBlock<Tracer: SimulationTracer> {
     pub blob_gas_used: u64,
     /// Updated after each order.
     pub coinbase_profit: U256,
-    /// Txs belonging to successfully executed orders.
-    pub executed_tx: Vec<TransactionSignedEcRecoveredWithBlobs>,
-    /// Receipts belonging to successfully executed orders.
-    pub receipts: Vec<Receipt>,
+    /// Tx execution info belonging to successfully executed orders.
+    pub executed_tx_infos: Vec<TransactionExecutionInfo>,
     pub tracer: Tracer,
 }
 
@@ -424,11 +428,10 @@ pub struct ExecutionResult {
     pub inplace_sim: SimValue,
     pub gas_used: u64,
     pub order: Order,
-    pub txs: Vec<TransactionSignedEcRecoveredWithBlobs>,
+    pub tx_infos: Vec<TransactionExecutionInfo>,
     /// Patch to get the executed OrderIds for merged sbundles (see: [`BundleOk::original_order_ids`],[`ShareBundleMerger`] )
     /// Fully dropped orders (TxRevertBehavior::AllowedExcluded allows it!) are not included.
     pub original_order_ids: Vec<OrderId>,
-    pub receipts: Vec<Receipt>,
     pub nonces_updated: Vec<(Address, u64)>,
     pub paid_kickbacks: Vec<(Address, U256)>,
 }
@@ -449,6 +452,7 @@ pub enum InsertPayoutTxErr {
     NoSigner,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ExecutionError {
     #[error("Order error: {0}")]
@@ -529,8 +533,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             gas_reserved: self.gas_reserved,
             blob_gas_used: self.blob_gas_used,
             coinbase_profit: self.coinbase_profit,
-            executed_tx: self.executed_tx,
-            receipts: self.receipts,
+            executed_tx_infos: self.executed_tx_infos,
             tracer,
         }
     }
@@ -554,7 +557,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         state: &mut BlockState,
         result_filter: &dyn Fn(&SimValue) -> Result<(), ExecutionError>,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
-        if ctx.builder_signer.is_none() && !order.sim_value.paid_kickbacks.is_empty() {
+        if ctx.builder_signer.is_none() && !order.sim_value.paid_kickbacks().is_empty() {
             // Return here to avoid wasting time on a call to fork.commit_order that 99% will fail
             return Ok(Err(ExecutionError::OrderError(OrderErr::Bundle(
                 BundleErr::NoSigner,
@@ -577,12 +580,8 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             }
         };
 
-        let inplace_sim_result = SimValue::new(
-            ok_result.coinbase_profit,
-            ok_result.gas_used,
-            ok_result.blob_gas_used,
-            ok_result.paid_kickbacks.clone(),
-        );
+        let inplace_sim_result =
+            create_sim_value(&order.order, &ok_result, &ctx.mempool_tx_detector);
 
         match result_filter(&inplace_sim_result) {
             Ok(()) => {}
@@ -595,16 +594,14 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         self.gas_used += ok_result.gas_used;
         self.blob_gas_used += ok_result.blob_gas_used;
         self.coinbase_profit += ok_result.coinbase_profit;
-        self.executed_tx.extend(ok_result.txs.clone());
-        self.receipts.extend(ok_result.receipts.clone());
+        self.executed_tx_infos.extend(ok_result.tx_infos.clone());
         Ok(Ok(ExecutionResult {
             coinbase_profit: ok_result.coinbase_profit,
             inplace_sim: inplace_sim_result,
             gas_used: ok_result.gas_used,
             order: order.order.clone(),
-            txs: ok_result.txs,
+            tx_infos: ok_result.tx_infos,
             original_order_ids: ok_result.original_order_ids,
-            receipts: ok_result.receipts,
             nonces_updated: ok_result.nonces_updated,
             paid_kickbacks: ok_result.paid_kickbacks,
         }))
@@ -644,6 +641,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
 
         let inplace_sim_result = SimValue::new(
             ok_result.coinbase_profit,
+            ok_result.coinbase_profit,
             ok_result.gas_used,
             ok_result.blob_gas_used,
             ok_result.paid_kickbacks.clone(),
@@ -652,16 +650,14 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         self.gas_used += ok_result.gas_used;
         self.blob_gas_used += ok_result.blob_gas_used;
         self.coinbase_profit += ok_result.coinbase_profit;
-        self.executed_tx.extend(ok_result.txs.clone());
-        self.receipts.extend(ok_result.receipts.clone());
+        self.executed_tx_infos.extend(ok_result.tx_infos.clone());
         Ok(Ok(ExecutionResult {
             coinbase_profit: ok_result.coinbase_profit,
             inplace_sim: inplace_sim_result,
             gas_used: ok_result.gas_used,
             order: order.clone(),
-            txs: ok_result.txs,
+            tx_infos: ok_result.tx_infos,
             original_order_ids: ok_result.original_order_ids,
-            receipts: ok_result.receipts,
             nonces_updated: ok_result.nonces_updated,
             paid_kickbacks: ok_result.paid_kickbacks,
         }))
@@ -714,14 +710,13 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         let mut fork = PartialBlockFork::new(state, ctx, local_ctx).with_tracer(&mut self.tracer);
         let exec_result = fork.commit_tx(&tx, self.gas_used, 0, self.blob_gas_used)?;
         let ok_result = exec_result?;
-        if !ok_result.receipt.success {
+        if !ok_result.tx_info.receipt.success {
             return Err(InsertPayoutTxErr::PayoutTxReverted);
         }
 
-        self.gas_used += ok_result.gas_used;
+        self.gas_used += ok_result.tx_info.gas_used;
         self.blob_gas_used += ok_result.blob_gas_used;
-        self.executed_tx.push(ok_result.tx);
-        self.receipts.push(ok_result.receipt);
+        self.executed_tx_infos.push(ok_result.tx_info);
 
         Ok(())
     }
@@ -741,9 +736,11 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             .is_prague_active_at_timestamp(ctx.attributes.timestamp())
         {
             // Collect all EIP-6110 deposits
-            let deposit_requests =
-                eip6110::parse_deposits_from_receipts(&ctx.chain_spec, &self.receipts)
-                    .map_err(BlockExecutionError::Validation)?;
+            let deposit_requests = eip6110::parse_deposits_from_receipts(
+                &ctx.chain_spec,
+                self.executed_tx_infos.iter().map(|info| &info.receipt),
+            )
+            .map_err(BlockExecutionError::Validation)?;
 
             let mut requests = Requests::default();
             if !deposit_requests.is_empty() {
@@ -810,7 +807,11 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         let (bundle, _) = state.into_parts();
         let execution_outcome = ExecutionOutcome::new(
             bundle,
-            vec![self.receipts],
+            vec![self
+                .executed_tx_infos
+                .iter()
+                .map(|info| info.receipt.clone())
+                .collect()],
             block_number,
             vec![requests.clone().unwrap_or_default()],
         );
@@ -834,13 +835,19 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         let step_start = Instant::now();
 
         // create the block header
-        let transactions_root = proofs::calculate_transaction_root(&self.executed_tx);
+        let transactions_root = proofs::calculate_transaction_root(
+            &self
+                .executed_tx_infos
+                .iter()
+                .map(|info| &info.tx)
+                .collect::<Vec<_>>(),
+        );
 
         let transactions_root_time_ms = elapsed_ms(step_start);
         let step_start = Instant::now();
 
         // double check blocked txs
-        for tx_with_blob in &self.executed_tx {
+        for tx_with_blob in self.executed_tx_infos.iter().map(|info| &info.tx) {
             if ctx.blocklist.contains(&tx_with_blob.signer()) {
                 return Err(FinalizeError::Other(eyre::eyre!(
                     "To from blocked address."
@@ -858,7 +865,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             .chain_spec
             .is_cancun_active_at_timestamp(ctx.attributes.timestamp)
         {
-            for tx_with_blob in &self.executed_tx {
+            for tx_with_blob in self.executed_tx_infos.iter().map(|info| &info.tx) {
                 if !tx_with_blob.blobs_sidecar.blobs.is_empty() {
                     txs_blob_sidecars.push(tx_with_blob.blobs_sidecar.clone());
                 }
@@ -905,9 +912,9 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             header,
             body: BlockBody {
                 transactions: self
-                    .executed_tx
+                    .executed_tx_infos
                     .into_iter()
-                    .map(|t| t.into_internal_tx_unsecure().into_inner())
+                    .map(|t| t.tx.into_internal_tx_unsecure().into_inner())
                     .collect(),
                 ommers: vec![],
                 withdrawals,
@@ -965,8 +972,7 @@ impl PartialBlock<()> {
             gas_reserved: 0,
             blob_gas_used: 0,
             coinbase_profit: U256::ZERO,
-            executed_tx: Vec::new(),
-            receipts: Vec::new(),
+            executed_tx_infos: Vec::new(),
             tracer: (),
         }
     }
@@ -982,4 +988,143 @@ pub enum FillOrdersError {
     CriticalCommitOrderError(#[from] CriticalCommitOrderError),
     #[error("Payout tx error: {0}")]
     PayoutTxErr(#[from] InsertPayoutTxErr),
+}
+
+/// Create the sim value from the order_ok.
+/// non_mempool_coinbase_profit for s/bundles will filter tx profit.
+/// non_mempool_coinbase_profitm for txs is the same as full_coinbase_profit.
+pub fn create_sim_value(
+    order: &Order,
+    order_ok: &OrderOk,
+    mempool_detector: &MempoolTxsDetector,
+) -> SimValue {
+    let non_mempool_coinbase_profit = if let Order::Tx(_) = order {
+        // We don't filter for mempool txs.
+        order_ok.coinbase_profit
+    } else {
+        let non_mempool_coinbase_profit = order_ok
+            .tx_infos
+            .iter()
+            .filter(|tx_info| !mempool_detector.is_mempool(&tx_info.tx))
+            .map(|tx_info| tx_info.coinbase_profit)
+            .sum::<I256>();
+        if non_mempool_coinbase_profit.is_positive() {
+            non_mempool_coinbase_profit.unsigned_abs()
+        } else {
+            error!(
+            non_mempool_coinbase_profit = format_ether(non_mempool_coinbase_profit),
+            "Non mempool orders have always positive profit but a negative value was found on a OrderOk");
+            U256::ZERO
+        }
+    };
+
+    SimValue::new(
+        order_ok.coinbase_profit,
+        non_mempool_coinbase_profit,
+        order_ok.gas_used,
+        order_ok.blob_gas_used,
+        order_ok.paid_kickbacks.clone(),
+    )
+}
+#[cfg(test)]
+mod test {
+    use alloy_primitives::I256;
+
+    use crate::{
+        live_builder::order_input::mempool_txs_detector::MempoolTxsDetector,
+        primitives::{MempoolTx, Order, TestDataGenerator},
+    };
+
+    use super::{create_sim_value, OrderOk, TransactionExecutionInfo};
+
+    /// Create a bundle with 2 txs, one from mempool and the other not.
+    /// sim_value.non_mempool_profit_info().coinbase_profit() should only sum the profit for the second.
+    #[test]
+    fn test_create_sim_value_bundle_non_mempool_coinbase_profit() {
+        let detector = MempoolTxsDetector::new();
+        let mut data_gen = TestDataGenerator::default();
+        let tx1 = data_gen.create_tx_with_blobs_nonce(Default::default());
+        detector.add_tx(&Order::Tx(MempoolTx {
+            tx_with_blobs: tx1.clone(),
+        }));
+        let tx2 = data_gen.create_tx_with_blobs_nonce(Default::default());
+        let profit_1 = I256::unchecked_from(1000);
+        let profit_2 = I256::unchecked_from(10000);
+        let order_ok = OrderOk {
+            coinbase_profit: Default::default(),
+            gas_used: Default::default(),
+            cumulative_gas_used: Default::default(),
+            blob_gas_used: Default::default(),
+            cumulative_blob_gas_used: Default::default(),
+            tx_infos: vec![
+                TransactionExecutionInfo {
+                    tx: tx1,
+                    receipt: Default::default(),
+                    gas_used: Default::default(),
+                    coinbase_profit: profit_1,
+                },
+                TransactionExecutionInfo {
+                    tx: tx2,
+                    receipt: Default::default(),
+                    gas_used: Default::default(),
+                    coinbase_profit: profit_2,
+                },
+            ],
+            original_order_ids: Default::default(),
+            nonces_updated: Default::default(),
+            paid_kickbacks: Default::default(),
+            used_state_trace: Default::default(),
+        };
+        // dummy bundle just to let know create_sim_value this is a bundle.
+        let dummy_bundle = Order::Bundle(data_gen.create_bundle(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        ));
+        let sim_value = create_sim_value(&dummy_bundle, &order_ok, &detector);
+        assert_eq!(
+            sim_value.non_mempool_profit_info().coinbase_profit(),
+            profit_2.unsigned_abs()
+        );
+    }
+
+    /// Create a tx from mempool.
+    /// sim_value.non_mempool_profit_info().coinbase_profit() should be the same as full_profit_info = tx profit
+    #[test]
+    fn test_create_sim_value_tx_non_mempool_coinbase_profit() {
+        let detector = MempoolTxsDetector::new();
+        let mut data_gen = TestDataGenerator::default();
+        let tx = data_gen.create_tx_with_blobs_nonce(Default::default());
+        let order = Order::Tx(MempoolTx {
+            tx_with_blobs: tx.clone(),
+        });
+        detector.add_tx(&order);
+        let profit = I256::unchecked_from(1000);
+        let order_ok = OrderOk {
+            coinbase_profit: profit.unsigned_abs(),
+            gas_used: Default::default(),
+            cumulative_gas_used: Default::default(),
+            blob_gas_used: Default::default(),
+            cumulative_blob_gas_used: Default::default(),
+            tx_infos: vec![TransactionExecutionInfo {
+                tx,
+                receipt: Default::default(),
+                gas_used: Default::default(),
+                coinbase_profit: profit,
+            }],
+            original_order_ids: Default::default(),
+            nonces_updated: Default::default(),
+            paid_kickbacks: Default::default(),
+            used_state_trace: Default::default(),
+        };
+        let sim_value = create_sim_value(&order, &order_ok, &detector);
+        assert_eq!(
+            sim_value.non_mempool_profit_info().coinbase_profit(),
+            profit.unsigned_abs()
+        );
+        assert_eq!(
+            sim_value.non_mempool_profit_info().coinbase_profit(),
+            sim_value.full_profit_info().coinbase_profit(),
+        );
+    }
 }

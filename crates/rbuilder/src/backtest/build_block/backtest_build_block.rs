@@ -142,7 +142,7 @@ where
                         format_ether(order_result.coinbase_profit),
                     );
                     if let Order::Bundle(_) | Order::ShareBundle(_) = order_result.order {
-                        for tx in &order_result.txs {
+                        for tx in order_result.tx_infos.iter().map(|info| &info.tx) {
                             println!("      ↳ {:?}", tx.hash());
                         }
 
@@ -207,7 +207,7 @@ fn print_simulated_orders(
 ) {
     println!("Simulated orders: ({} total)", sim_orders.len());
     let mut sorted_orders = sim_orders.to_owned();
-    sorted_orders.sort_by_key(|order| order.sim_value.coinbase_profit);
+    sorted_orders.sort_by_key(|order| order.sim_value.full_profit_info().coinbase_profit());
     sorted_orders.reverse();
     for order in sorted_orders {
         let order_timestamp = order_and_timestamp
@@ -221,8 +221,8 @@ fn print_simulated_orders(
             "{:>74} slot_time_ms: {:>8}, gas: {:>8} profit: {}",
             order.order.id().to_string(),
             slot_time_ms,
-            order.sim_value.gas_used,
-            format_ether(order.sim_value.coinbase_profit),
+            order.sim_value.gas_used(),
+            format_ether(order.sim_value.full_profit_info().coinbase_profit()),
         );
     }
     println!();
