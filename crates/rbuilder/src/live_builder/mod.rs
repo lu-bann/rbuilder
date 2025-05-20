@@ -348,8 +348,6 @@ where
                 None => debug!("No constraints cuttoff time, proceeding with block building"),
             };
 
-            // tokio::time::sleep(Duration::from_secs(4)).await;
-
             let root_hasher =
                 Arc::from(self.provider.root_hasher(payload.parent_block_num_hash())?);
 

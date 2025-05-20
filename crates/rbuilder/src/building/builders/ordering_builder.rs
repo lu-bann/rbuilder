@@ -116,7 +116,8 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
 
         match order_intake_consumer.blocking_consume_next_batch() {
             Ok(ok) => {
-                if !ok {
+                // Only break the loop if there are no orders to process and no slot constraints
+                if !ok && slot_constraints.is_none() {
                     break 'building;
                 }
             }
