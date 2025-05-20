@@ -27,7 +27,7 @@ use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, info_span, trace, warn, Instrument, Span};
+use tracing::{error, info, info_span, trace, warn, Instrument, Span};
 
 use super::{
     bid_observer::BidObserver,
