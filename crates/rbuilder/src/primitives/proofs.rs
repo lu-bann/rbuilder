@@ -1,4 +1,5 @@
 use super::constraints::SignedConstraints;
+use alloy_consensus::{SignableTransaction};
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{TxHash, B256};
 use ethereum_consensus::{
@@ -33,12 +34,19 @@ impl TryFrom<SignedConstraints> for SignedConstraintsWithProofData {
         for transaction in value.message.transactions.iter() {
             let tx = PooledTransaction::decode_2718(&mut transaction.as_slice())
                 .map_err(|e| ProofError::DecodingFailed(e.to_string()))?;
-
             let tx_hash = *tx.tx_hash();
 
-            // Compute the hash tree root on the transaction object decoded without the optional
-            // sidecar. this is to prevent hashing the blobs of type 3 transactions.
-            let root = transaction
+            let raw_tx = if tx.is_eip4844() {
+                // If the transaction is of type 3, we need to remove the optional sidecar
+                // before computing the hash tree root.
+                let (tx_with_sidecar, sig, _) = tx.as_eip4844().unwrap().clone().into_parts();
+                let tx_without_sidecar = tx_with_sidecar.tx.into_signed(sig);
+                Transaction::try_from(tx_without_sidecar.encoded_2718().as_ref()).unwrap()
+            } else {
+                transaction.clone()
+            };
+
+            let root = raw_tx
                 .hash_tree_root()
                 .map_err(|e| ProofError::DecodingFailed(e.to_string()))?;
             let root = Hash256::from_slice(root.as_slice());

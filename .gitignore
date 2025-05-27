@@ -13,3 +13,4 @@ genesis.json
 .code
 .idea
 .vscode
+.DS_Store
